@@ -4532,8 +4532,8 @@ class _ProofCompletion:
 
 def _proof_group_key(key):
     return type(key) is tuple and len(key) == 3 and type(key[0]) is str and type(key[1]) is str \
-        and key[0] in ("split", "subgroup", "project", "star-split", "star-wrap", "star-merge") \
-        and key[1] in ("match", "rest") and (key[0] in ("split", "star-split") or key[1] == "match") \
+        and key[0] in ("split", "subgroup", "project", "star-split", "star-wrap", "star-merge", "suppress-split") \
+        and key[1] in ("match", "rest") and (key[0] in ("split", "star-split", "suppress-split") or key[1] == "match") \
         and type(key[2]) is tuple and len(key[2]) <= 128 \
         and all(type(index) is int and 0 <= index < 100_000 for index in key[2])
 
@@ -4559,7 +4559,7 @@ class _ProofCollectionObject:
                 or type(self.identity[2]) is not int or self.identity[2] < 0 \
                 or self.identity[3] not in ("literal", "args", "implicit-args", "captured", "empty", "slice", "args-store",
                                            "legacy-captured", "legacy-args", "derived-input", "derived-args",
-                                           "derived-captured", "derived-wrap-input", "split-result") \
+                                           "derived-captured", "derived-wrap-input", "split-result", "suppress-args") \
                 or (len(self.identity) == 5) != self.identity[3].startswith("derived-") \
                 or (len(self.identity) == 5 and not _proof_group_key(self.identity[4])) \
                 or type(self.items) is not tuple or any(type(item) is not _ProofValue for item in self.items) \
@@ -4778,6 +4778,9 @@ class _ProofState:
     def alias_count(self):
         values = [value for owner, name, value in self.bindings] \
             + [value for region, name, value in self.regions] + list(self.temporaries)
+        values.extend(_ProofValue(frozenset({frame[2]})) for frame in self.managers
+                      if frame and frame[0] == "suppress" and len(frame) == 5
+                      and type(frame[2]) is tuple and bool(frame[2]))
         if self.pending.value is not None:
             values.append(self.pending.value)
         count = len(self.borrowed_exceptions) + sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method", "type-union")
@@ -4829,6 +4832,9 @@ class _ProofState:
 
     def context_depth(self):
         active_depth = len(self.active)
+        for frame in self.managers:
+            if frame and frame[0] == "suppress" and len(frame) == 5 and type(frame[4]) is tuple:
+                active_depth = max(active_depth, len(frame[4]))
         for frame in self.continuation:
             if frame and frame[0] == "finally":
                 active_depth = max(active_depth, len(frame[3]) + (frame[2][0] == "raise"))
@@ -4867,6 +4873,18 @@ class _ProofEffects:
 
     _builtin_names = frozenset(vars(builtins))
     _builtin_types = frozenset(name for name, value in vars(builtins).items() if isinstance(value, type))
+    _suppress_class = ("stdlib-class", "contextlib.suppress")
+    _suppress_hooks = frozenset({"__new__", "__init__", "__enter__", "__exit__"})
+
+    @classmethod
+    def suppress_protocol(cls, name):
+        return _ProofValue(frozenset({("stdlib-protocol", "suppress." + name)}))
+
+    @staticmethod
+    def suppress_instance(token):
+        return type(token) is tuple and len(token) == 3 and token[:2] == ("namespace", "object") \
+            and type(token[2]) is tuple and len(token[2]) == 2 and token[2][0] == "suppress" \
+            and type(token[2][1]) is int and token[2][1] >= 0
     # Snapshot only genuine interpreter-owned exception metadata. This never
     # resolves inspected attributes, constructs exceptions or invokes a model.
     _exception_mros = MappingProxyType({name: tuple(base.__name__ for base in value.__mro__)
@@ -4920,7 +4938,8 @@ class _ProofEffects:
                     raise _ProofIncomplete("unsupported-exception-construction")
                 return ("native-exception", name, site), None
             return None, "TypeError"
-        if token and token[0] in ("literal", "singleton", "namespace", "plain-object", "plain-string", "const-callable", "type-union"):
+        if token and token[0] in ("literal", "singleton", "namespace", "plain-object", "plain-string", "const-callable", "type-union",
+                                  "stdlib-class", "stdlib-protocol"):
             return None, "TypeError"
         raise _ProofIncomplete("opaque-raised-value")
 
@@ -4970,6 +4989,10 @@ class _ProofEffects:
             return len(token) == 2 and type(token[1]) is int
         if token[0] == "type-union":
             return cls.union_types(token) is not None
+        if token[0] == "stdlib-class":
+            return token == cls._suppress_class
+        if token[0] == "stdlib-protocol":
+            return len(token) == 2 and token[1] in {"suppress." + name for name in cls._suppress_hooks}
         return len(token) == 2 and token[0] == "exception" and cls.exception_name(token[1]) is not None
 
     @classmethod
@@ -4994,6 +5017,8 @@ class _ProofEffects:
         if any(token[0] == "native" and (len(token) != 2 or type(token[1]) is not str
                 or token[1] not in cls._builtin_names) for token in tokens):
             raise _ProofIncomplete("unsupported-native-operand")
+        if any(token[0] == "stdlib-class" for token in tokens):
+            raise _ProofIncomplete("unsupported-union-class")
         # The entry contract also admits these legacy builtin tokens. Their
         # runtime objects are the same singletons as ordinary literal loads.
         singletons = {"True": True, "False": False, "None": None}
@@ -5181,7 +5206,7 @@ class _ProofEffects:
     def exception_values(state):
         # Ordinary namespace fields are edges, not independent roots.
         values = [value for owner, name, value in state.bindings] \
-            + [value for region, name, value in state.regions if region[0] in ("globals", "builtins")] \
+            + [value for region, name, value in state.regions if region[0] in ("globals", "builtins", "contextlib", "suppress-class")] \
             + list(state.temporaries) \
             + [_ProofValue(frozenset({("exception", payload)})) for payload in state.borrowed_exceptions]
         if state.pending.value is not None:
@@ -5235,6 +5260,8 @@ class _ProofEffects:
     def exception_work(cls, state, extra=()):
         values = list(cls.exception_values(state)) + list(extra)
         count = 1 + len(state.active) + len(state.managers) + len(state.continuation)
+        count += sum(4 + len(frame[4]) for frame in state.managers
+                     if frame and frame[0] == "suppress" and len(frame) == 5 and type(frame[4]) is tuple)
         count += sum(3 + len(frame[6]) + len(frame[8]) for frame in state.continuation
                      if frame and frame[0] == "except-star")
         for item in state.exception_objects:
@@ -5243,7 +5270,8 @@ class _ProofEffects:
         for item in state.collection_objects:
             count += 1 + len(item.items)
             values.extend(item.items)
-        values.extend(value for region, name, value in state.regions if region[0] not in ("globals", "builtins"))
+        values.extend(value for region, name, value in state.regions
+                      if region[0] not in ("globals", "builtins", "contextlib", "suppress-class"))
         for value in values:
             count += cls.value_work(value)
         return count
@@ -5436,9 +5464,10 @@ class _ProofEffects:
         live, held, unused, unknown, regions = cls.reachable(state)
         objects = tuple(item for item in state.exception_objects if item.payload in live)
         collections = tuple(item for item in state.collection_objects if item.identity in held)
-        if objects == state.exception_objects and collections == state.collection_objects:
+        retained_regions = tuple(item for item in state.regions if item[0][0] != "suppress" or item[0] in regions)
+        if objects == state.exception_objects and collections == state.collection_objects and retained_regions == state.regions:
             return state
-        return replace(state, exception_objects=objects, collection_objects=collections,
+        return replace(state, exception_objects=objects, collection_objects=collections, regions=retained_regions,
                        exception_metadata=cls._exception_partition(objects, state.exception_metadata))
 
     @classmethod
@@ -5557,11 +5586,53 @@ class _ProofEffects:
                 continue
             if atom is None or atom[0] in ("opaque", "exception-types"):
                 raise _ProofIncomplete("unknown-group-matcher")
-            if info is None and (atom[0] in ("function", "const-callable", "exception-method") or (
+            if info is None and (atom[0] in ("function", "const-callable", "exception-method", "stdlib-protocol") or (
                     atom[0] == "native" and atom[1] not in cls._builtin_types and version[:2] == (3, 14))):
                 raise _ProofIncomplete("unsupported-group-predicate")
             return None, "TypeError"
         return ("types", tuple(result)), None
+
+    @classmethod
+    def suppress_match(cls, value, error, state, charge, limits):
+        name = cls.exception_name(error)
+        if name is None:
+            raise _ProofIncomplete("unknown-suppress-exception")
+        pending = [(value, 0)]
+        while pending:
+            charge(1)
+            candidate, depth = pending.pop()
+            token = cls.single(candidate)
+            if token is None:
+                raise _ProofIncomplete("opaque-suppress-classinfo")
+            info = cls.sequence_info(candidate, state)
+            if info is not None and token[1] == "tuple":
+                if depth >= limits["depth"]:
+                    raise _ProofIncomplete("suppress-depth-budget")
+                charge(1 + len(info[0]))
+                pending.extend((part, depth + 1) for part in reversed(info[0]))
+                continue
+            union = cls.union_types(token)
+            if union is not None:
+                charge(1 + len(union))
+                if any(part in cls._exception_mros[name] for part in union):
+                    return True, None
+                continue
+            if token[0] == "native" and len(token) == 2 and token[1] in cls._builtin_types:
+                candidate_name = cls._exception_mros.get(token[1], (token[1],))[0]
+                if candidate_name in cls._exception_mros[name]:
+                    return True, None
+                continue
+            if token == cls._suppress_class:
+                # ABCMeta may consult a virtual-subclass registry not carried
+                # by the class identity. Do not turn absence of registry facts
+                # into a concrete miss.
+                raise _ProofIncomplete("suppress-abc-protocol")
+            if token[0] in ("opaque", "empty-class"):
+                raise _ProofIncomplete("opaque-suppress-subclass-protocol")
+            if cls.closed_leaf(token) or token[0] in ("collection", "sequence", "namespace", "function", "const-callable"):
+                return None, "TypeError"
+            raise _ProofIncomplete("opaque-suppress-classinfo")
+        return False, None
 
     @classmethod
     def derive_subset(cls, state, original, children, site, key, charge, limits):
@@ -5614,7 +5685,7 @@ class _ProofEffects:
         New objects stay in the bounded table throughout this operation. Only
         the ordinary evaluator can drop holds/prune after publishing results.
         """
-        if operation not in ("split", "subgroup", "project", "star-split") or matcher[0] not in ("types", "leaves"):
+        if operation not in ("split", "subgroup", "project", "star-split", "suppress-split") or matcher[0] not in ("types", "leaves"):
             raise _ProofIncomplete("unsupported-group-split")
         frames = [[root, path_prefix, 0, None, None]]
         while frames:
@@ -5738,7 +5809,8 @@ class _ProofEffects:
                     return None, "TypeError"
                 candidates.append(cls._exception_mros[member[1]][0])
             elif member and member[0] in ("literal", "singleton", "namespace", "plain-object", "plain-string",
-                                        "const-callable", "exception", "exception-types", "sequence", "collection", "type-union"):
+                                        "const-callable", "exception", "exception-types", "sequence", "collection", "type-union",
+                                        "stdlib-class", "stdlib-protocol"):
                 return None, "TypeError"
             else:
                 raise _ProofIncomplete("opaque-handler-type")
@@ -5917,6 +5989,14 @@ class _ProofEffects:
     def region_value(cls, index, scope, state, region, name):
         if state.region_defined(region, name):
             return state.region_value(region, name)
+        if region == ("contextlib", 0):
+            if name in ("issubclass", "BaseExceptionGroup", "__getattr__"):
+                return _ProofValue.absent()
+            return _ProofValue(frozenset({cls._suppress_class})) if name == "suppress" \
+                else _ProofValue.unknown_value("contextlib-member")
+        if region == ("suppress-class", 0):
+            return cls.suppress_protocol(name) if name in cls._suppress_hooks \
+                else _ProofValue.unknown_value("suppress-class-member")
         if region == ("builtins", 0):
             return cls.builtin(state, name)
         if region == ("globals", 0):
@@ -5933,6 +6013,31 @@ class _ProofEffects:
             if name in cls._implicit_module_names:
                 return _ProofValue.unknown_value("implicit-module-binding")
         return _ProofValue.absent()
+
+    @classmethod
+    def contextlib_global(cls, index, scope, state, name):
+        value = cls.region_value(index, scope, state, ("contextlib", 0), name)
+        if value == _ProofValue.absent():
+            # These functions capture the real builtin mapping, independently
+            # of the inspected caller's selected frame builtins.
+            value = cls.builtin(state, name)
+        if value.unknown or value.is_unbound:
+            raise _ProofIncomplete("opaque-contextlib-global")
+        return value, "NameError" if value == _ProofValue.absent() else None
+
+    @classmethod
+    def suppress_subclass_callable(cls, value):
+        if value == _ProofValue(frozenset({("native", "issubclass")})):
+            return None
+        token = cls.single(value)
+        if token and token[0] in ("literal", "singleton", "plain-object", "plain-string", "type-union", "exception", "collection"):
+            return "TypeError"
+        if token and len(token) == 2 and token[0] == "native" and token[1] in ("True", "False", "None", "Ellipsis", "NotImplemented"):
+            return "TypeError"
+        if token and len(token) == 3 and token[0] == "const-callable" and type(token[1]) is int \
+                and type(token[2]) is int and token[2] in (0, 1):
+            return "TypeError"  # The supported constant summary accepts zero args.
+        raise _ProofIncomplete("opaque-suppress-issubclass")
 
     @classmethod
     def global_value(cls, index, scope, state, name):
@@ -6041,6 +6146,13 @@ class _ProofEffects:
         if attribute and index.runtime_name(scope, key) != key:
             raise _ProofIncomplete("mangled-runtime-namespace")
         atom = cls.single(receiver)
+        if attribute and atom == cls._suppress_class:
+            if key not in cls._suppress_hooks:
+                raise _ProofIncomplete("unsupported-suppress-class-member")
+            value = cls.region_value(index, scope, state, ("suppress-class", 0), key)
+            if value == _ProofValue.absent():
+                raise _ProofIncomplete("suppress-inherited-member")
+            return value, None
         if attribute and atom and atom[0] == "exception":
             item = state.exception_object(atom[1])
             if item is None:
@@ -6081,6 +6193,12 @@ class _ProofEffects:
         elif view != "mapping":
             return None, "TypeError"
         value = cls.region_value(index, scope, state, region, key)
+        if attribute and region == ("contextlib", 0) and value == _ProofValue.absent() \
+                and cls.region_value(index, scope, state, region, "__getattr__") != _ProofValue.absent():
+            raise _ProofIncomplete("contextlib-attribute-protocol")
+        if attribute and region[0] == "suppress" and key != "_exceptions" and (
+                not state.region_defined(region, key) or value == _ProofValue.absent()):
+            raise _ProofIncomplete("suppress-inherited-member")
         if value == _ProofValue.absent():
             return None, "AttributeError" if attribute else "KeyError"
         return value, None
@@ -6350,6 +6468,16 @@ class _ProofEffects:
         if attribute and index.runtime_name(scope, key) != key:
             raise _ProofIncomplete("mangled-runtime-namespace")
         atom = cls.single(receiver)
+        if attribute and atom == cls._suppress_class:
+            if key not in cls._suppress_hooks:
+                raise _ProofIncomplete("unsupported-suppress-class-protocol")
+            region = ("suppress-class", 0)
+            old = cls.region_value(index, scope, state, region, key)
+            if delete and (old == _ProofValue.absent() or (key == "__new__" and not state.region_defined(region, key))):
+                return replace(state, pending=_ProofCompletion("raise", "AttributeError"))
+            new = _ProofValue.absent() if delete else value
+            cls.check_release(old, new, state, ("region", region, key))
+            return state.write_region(region, key, new)
         if attribute and atom and atom[0] == "exception":
             if profile is None or site is None:
                 raise _ProofIncomplete("unowned-exception-store-site")
@@ -6357,6 +6485,10 @@ class _ProofEffects:
         if atom is None or atom[0] != "namespace":
             raise _ProofIncomplete("opaque-store")
         _, view, region = atom
+        if region == ("contextlib", 0) and key == "suppress":
+            # Rebinding can retire the original class and its opaque members;
+            # never silently keep that class alive as a borrowed global root.
+            raise _ProofIncomplete("contextlib-class-rebinding")
         if (attribute and view not in ("module", "object")) or (not attribute and view != "mapping"):
             raise _ProofIncomplete("unsupported-store-view")
         if attribute and view == "object" and key.startswith("__"):
@@ -6702,6 +6834,10 @@ class _ProofContext:
             return ("TypeError", "RuntimeError")
         if isinstance(node, (ast.UnaryOp, ast.ExceptHandler)):
             return ("TypeError",)
+        if isinstance(node, ast.withitem):
+            return ("TypeError", "AttributeError", "NameError")
+        if isinstance(node, ast.ImportFrom):
+            return ("ImportError",)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
             return ("TypeError",)
         if isinstance(node, ast.FormattedValue):
@@ -6759,9 +6895,14 @@ class _ProofContext:
             return all(frame in (("no-active",), ("unknown-active",)) or (
                 len(frame) == 2 and frame[0] == "error" and error(frame[1])) for frame in frames)
 
-        if (state.pending.kind == "raise" and not error(state.pending.error)) \
-                or not active(state.active) or state.managers:
+        if (state.pending.kind == "raise" and not error(state.pending.error)) or not active(state.active):
             return False
+        for frame in state.managers:
+            if len(frame) != 5 or frame[0] != "suppress" or type(frame[1]) is not int or frame[1] < 0 \
+                    or not _ProofEffects.suppress_instance(frame[2]) \
+                    or frame[3] != ("stdlib-protocol", "suppress.__exit__") \
+                    or type(frame[4]) is not tuple or not active(frame[4]):
+                return False
         for frame in state.continuation:
             if not frame or frame[0] not in ("finally", "except-search", "handler", "except-star"):
                 return False
@@ -6872,12 +7013,15 @@ class _ProofContext:
                     # walk by context capacity. Host tuple sharing/copying is
                     # not semantic work; charge the same stored slots either
                     # way, once per canonical uncached entry state.
-                    slots = len(state.active) + len(state.continuation)
+                    slots = len(state.active) + len(state.continuation) + len(state.managers)
+                    slots += sum(4 + len(frame[4]) for frame in state.managers)
                     slots += sum(len(frame[8]) + 3 + len(frame[6]) if frame[0] == "except-star"
                                  else len(frame[3]) for frame in state.continuation)
                     self._charge(stats, slots + (state.pending.kind == "raise"))
                     errors = [state.pending.error] if state.pending.kind == "raise" else []
                     active = list(state.active)
+                    for frame in state.managers:
+                        active.extend(frame[4])
                     for frame in state.continuation:
                         if frame[0] == "except-star":
                             active.extend(frame[8])
@@ -6924,7 +7068,7 @@ class _ProofContext:
                     elif identity[3] == "implicit-args":
                         valid = identity[1] == "tuple" and bool(self._implicit_error_kinds(allocation))
                     elif identity[3].startswith("derived-"):
-                        valid = len(identity) == 5 and isinstance(allocation, (ast.Call, ast.TryStar)) \
+                        valid = len(identity) == 5 and isinstance(allocation, (ast.Call, ast.TryStar, ast.withitem)) \
                             and _proof_group_key(identity[4]) \
                             and identity[1] == ("list" if identity[3] == "derived-input" else "tuple") \
                             and len(identity[4][2]) <= self.limits["depth"]
@@ -6947,7 +7091,7 @@ class _ProofContext:
                     except (IndexError, KeyError):
                         allocation = parent = None
                     origin = (name in self._implicit_error_kinds(allocation) if item.origin == "implicit" else (
-                        isinstance(allocation, (ast.Call, ast.TryStar)) and _proof_group_key(item.payload[3])
+                        isinstance(allocation, (ast.Call, ast.TryStar, ast.withitem)) and _proof_group_key(item.payload[3])
                         and len(item.payload[3][2]) <= self.limits["depth"]) if item.origin == "derived" else (
                             isinstance(allocation, (ast.Call, ast.Raise)) or (
                                 isinstance(parent, ast.Raise) and parent.cause is allocation)))
@@ -6991,6 +7135,7 @@ class _ProofContext:
                         return snapshot()
                 held = [value for storage, name, value in state.bindings] \
                     + [value for region, name, value in state.regions]
+                held.extend(_ProofValue(frozenset({frame[2]})) for frame in state.managers)
                 if state.pending.value is not None:
                     held.append(state.pending.value)
                 held.extend(_ProofValue(*frame[2][3]) for frame in state.continuation
@@ -7093,6 +7238,17 @@ class _ProofContext:
                         if not valid:
                             reasons.append("foreign-continuation")
                             return snapshot()
+                for frame in state.managers:
+                    try:
+                        site = self.index.node_for_id(frame[1])
+                        allocation = self.index.node_for_id(frame[2][2][1])
+                        valid = isinstance(site, ast.withitem) and isinstance(self.index.parent(site), ast.With) \
+                            and isinstance(allocation, ast.Call)
+                    except (KeyError, IndexError):
+                        valid = False
+                    if not valid:
+                        reasons.append("foreign-manager-entry")
+                        return snapshot()
                 depth = state.context_depth()
                 if depth > self.limits["contexts"]:
                     reasons.append("context-budget")
@@ -7114,9 +7270,12 @@ class _ProofContext:
                         return snapshot()
                 region_names = {}
                 for region, name, value in state.regions:
-                    if len(region) != 2 or region[0] not in ("globals", "builtins", "mapping", "object") \
+                    if region == ("suppress-class", 0) and name not in _ProofEffects._suppress_hooks:
+                        reasons.append("unsupported-suppress-class-entry")
+                        return snapshot()
+                    if len(region) != 2 or region[0] not in ("globals", "builtins", "mapping", "object", "suppress", "contextlib", "suppress-class") \
                             or type(region[1]) is not int or (
-                                region[0] in ("globals", "builtins") and region[1] != 0):
+                                region[0] in ("globals", "builtins", "contextlib", "suppress-class") and region[1] != 0):
                         reasons.append("foreign-region")
                         return snapshot()
                     region_names.setdefault(region, set()).add(name)
@@ -7308,6 +7467,22 @@ class _ProofContext:
                         _ProofOutcome(state, observation=("may-diverge", site, "trusted-print")))
             if token in (("native", "exec"), ("native", "eval")):
                 result, state = self._dynamic_call(node, token[1], scope, state, stats)
+            elif token == _ProofEffects._suppress_class:
+                for hook in ("__new__", "__init__"):
+                    if _ProofEffects.region_value(self.index, scope, state, ("suppress-class", 0), hook) \
+                            != _ProofEffects.suppress_protocol(hook):
+                        raise _ProofIncomplete("opaque-suppress-constructor")
+                if keywords:
+                    error = "TypeError"
+                else:
+                    if not all(_ProofEffects.retained_value(value, state) for value in arguments):
+                        raise _ProofIncomplete("unsupported-suppress-argument")
+                    region = ("suppress", self.index.node_id(node))
+                    reserve_graph(state, arguments, passes=2)
+                    result = _ProofEffects.fresh_namespace("object", region, state)
+                    entries, state = _ProofEffects.allocate_collection(state, "tuple", region[1], arguments, "suppress-args")
+                    state = state.write_region(region, "_exceptions", entries)
+                    self._check_alias_budget(state, stats)
             elif token and token[0] == "exception-method":
                 item = state.exception_object(token[1])
                 if item is None or not item.children or token[2] not in ("split", "subgroup"):
@@ -7697,6 +7872,7 @@ class _ProofContext:
                 restoring.update(self.index.node_id(self.index.parent(self.index.node_for_id(frame[0])))
                                  for frame in cursor if frame[1] == "handler-resume")
                 restoring.update(frame[0] for frame in cursor if frame[1] in ("star-next", "star-body-resume"))
+                restoring.update(frame[0] for frame in cursor if frame[1] == "with-exit")
                 depth = state.context_depth() \
                     + sum(frame[1] == "after" and frame[0] not in restoring for frame in cursor)
                 if depth > self.limits["contexts"]:
@@ -7897,6 +8073,93 @@ class _ProofContext:
                         result = fresh[0] if fresh else None
                 finish_star(cursor, state, _ProofCompletion("raise", result) if result is not None else _ProofCompletion())
 
+            def leave_manager(cursor, state):
+                with_site, unused, position = cursor[-1]
+                item = self.index.node_for_id(with_site).items[position]
+                site = self.index.node_id(item)
+                if not state.managers or state.managers[-1][:2] != ("suppress", site):
+                    raise _ProofIncomplete("foreign-manager-exit")
+                frame = state.managers[-1]
+                if frame[3] != ("stdlib-protocol", "suppress.__exit__"):
+                    raise _ProofIncomplete("opaque-manager-exit")
+                before = current = state
+                pending = state.pending
+                receiver = _ProofValue(frozenset({frame[2]}))
+                record(item, "exit", current)
+                if pending.kind == "raise":
+                    current = replace(current, active=frame[4] + (("error", pending.error),))
+                    depth = current.context_depth()
+                    if depth > self.limits["contexts"]:
+                        raise _ProofIncomplete("context-budget")
+                    stats["context_depth"] = max(stats["context_depth"], depth)
+                    fields = ()
+                    self._charge(stats)
+                    callee, error = _ProofEffects.contextlib_global(self.index, scope, current, "issubclass")
+                    if error is not None:
+                        fields = (("name", _ProofValue.literal("issubclass")),)
+                    if error is None:
+                        entries, error = _ProofEffects.member(self.index, scope, receiver, "_exceptions", current, attribute=True)
+                        if error is not None:
+                            fields = (("name", _ProofValue.literal("_exceptions")), ("obj", receiver))
+                    if error is None:
+                        error = _ProofEffects.suppress_subclass_callable(callee)
+                    matched = False
+                    if error is None:
+                        matched, error = _ProofEffects.suppress_match(entries, pending.error, current,
+                            lambda amount: self._charge(stats, amount), self.limits)
+                    if error is None and matched:
+                        pending = _ProofCompletion()
+                    elif error is None:
+                        # The second LOAD_GLOBAL/call happens on every first
+                        # miss, even for ordinary non-group exceptions.
+                        self._charge(stats)
+                        callee, error = _ProofEffects.contextlib_global(self.index, scope, current, "issubclass")
+                        if error is not None:
+                            fields = (("name", _ProofValue.literal("issubclass")),)
+                        if error is None:
+                            self._charge(stats)
+                            criterion, error = _ProofEffects.contextlib_global(self.index, scope, current, "BaseExceptionGroup")
+                            if error is not None:
+                                fields = (("name", _ProofValue.literal("BaseExceptionGroup")),)
+                        if error is None:
+                            error = _ProofEffects.suppress_subclass_callable(callee)
+                        is_group = False
+                        if error is None:
+                            is_group, error = _ProofEffects.suppress_match(criterion, pending.error, current,
+                                lambda amount: self._charge(stats, amount), self.limits)
+                        if error is None and is_group:
+                            original = current.exception_object(pending.error)
+                            if original is None:
+                                raise _ProofIncomplete("unowned-suppress-split")
+                            if not original.children:
+                                error = "AttributeError"
+                                fields = (("name", _ProofValue.literal("split")),
+                                          ("obj", _ProofValue(frozenset({("exception", pending.error)}))))
+                        if error is None and is_group:
+                            matcher, error = _ProofEffects.group_matcher(entries, current, self._native_profile[0],
+                            lambda amount: self._charge(stats, amount))
+                        if error is None and is_group:
+                            (matched_group, residual), current = _ProofEffects.split_owned(current, pending.error,
+                                matcher, site, "suppress-split", lambda amount: self._charge(stats, amount), self.limits)
+                            if residual is None:
+                                pending = _ProofCompletion()
+                            else:
+                                # contextlib raises the residual explicitly;
+                                # it is not a bare reraise with copied metadata.
+                                reserve_graph(current, passes=4)
+                                current = _ProofEffects.explicitly_raised(current, residual)
+                                pending = _ProofCompletion("raise", residual)
+                    if error is not None:
+                        current = self._implicit_error(item, error, current, stats, fields=fields)
+                        pending = current.pending
+                current = replace(current, pending=pending, active=frame[4], managers=current.managers[:-1])
+                dropped = (receiver,) + ((_ProofValue(frozenset({("exception", state.pending.error)})),)
+                                         if state.pending.kind == "raise" else ())
+                reserve_graph(before, dropped, passes=2)
+                _ProofEffects.check_dropped(before, current, dropped)
+                self._check_alias_budget(current, stats)
+                enqueue(cursor[:-1], current)
+
             for state in dict.fromkeys(entry):
                 enqueue(((owner, "body", 0),), state)
             seen = set()
@@ -7931,6 +8194,8 @@ class _ProofContext:
                             finish_star(cursor[:offset + 1], state, state.pending)
                         elif field == "star-body-resume":
                             resume_star_body(cursor[:offset + 1], state)
+                        elif field == "with-exit":
+                            leave_manager(cursor[:offset + 1], state)
                         elif field == "handler-next":
                             finish_search(cursor[:offset + 1], state, state.pending)
                         elif field == "handler-resume":
@@ -7939,7 +8204,7 @@ class _ProofContext:
                                 and state.pending.target == site:
                             destination = cursor[:offset] if state.pending.kind == "break" else cursor[:offset + 1]
                             enqueue(destination, replace(state, pending=_ProofCompletion()))
-                        elif field not in ("body", "orelse", "after", "for-first", "for-next", "finalbody", "try-body-done"):
+                        elif field not in ("body", "orelse", "after", "for-first", "for-next", "finalbody", "try-body-done", "with-item"):
                             raise _ProofIncomplete("unsupported-dispatch-frame")
                         else:
                             continue
@@ -7953,6 +8218,46 @@ class _ProofContext:
                     continue
                 container_id, field, position = cursor[-1]
                 container = self.index.node_for_id(container_id)
+                if field == "with-exit":
+                    self._charge(stats)
+                    leave_manager(cursor, state)
+                    continue
+                if field == "with-item":
+                    self._charge(stats)
+                    if position == len(container.items):
+                        enqueue(cursor[:-1] + ((container_id, "body", 0),), state)
+                        continue
+                    item = container.items[position]
+                    for outcome in expression(item.context_expr, state):
+                        if not outcome.normal:
+                            route(cursor, outcome)
+                            continue
+                        token = _ProofEffects.single(outcome.value)
+                        if not _ProofEffects.suppress_instance(token):
+                            if token and (_ProofEffects.closed_leaf(token) or token[0] == "collection"):
+                                current = self._implicit_error(item, "TypeError", outcome.state, stats)
+                                enqueue(cursor, current)
+                            else:
+                                raise _ProofIncomplete("opaque-manager-entry")
+                            continue
+                        current = outcome.state
+                        for hook in ("__enter__", "__exit__"):
+                            if _ProofEffects.region_value(self.index, scope, current, ("suppress-class", 0), hook) \
+                                    != _ProofEffects.suppress_protocol(hook):
+                                raise _ProofIncomplete("opaque-manager-entry")
+                        frame = ("suppress", self.index.node_id(item), token,
+                                 ("stdlib-protocol", "suppress.__exit__"), current.active)
+                        current = replace(current, managers=current.managers + (frame,))
+                        self._check_alias_budget(current, stats)
+                        record(item, "entry", current)
+                        following = cursor[:-1] + ((container_id, "with-exit", position),
+                                                  (container_id, "with-item", position + 1))
+                        if item.optional_vars is None:
+                            enqueue(following, current)
+                        else:
+                            for assigned in target_store(item.optional_vars, _ProofValue.literal(None), current):
+                                route(following, assigned)
+                    continue
                 if field == "try-body-done":
                     self._charge(stats)
                     enqueue(cursor[:-1] + ((container_id, "orelse", 0),), state)
@@ -8127,6 +8432,10 @@ class _ProofContext:
                         guards += ((site, "try-body-done", 0),)
                     enqueue(successor + ((site, "after", 0),) + guards + ((site, "body", 0),), state)
                     continue
+                elif isinstance(node, ast.With):
+                    site = self.index.node_id(node)
+                    enqueue(successor + ((site, "after", 0), (site, "with-item", 0)), state)
+                    continue
                 elif isinstance(node, ast.Return):
                     if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         raise _ProofIncomplete("return-outside-function")
@@ -8183,10 +8492,29 @@ class _ProofContext:
                             frozenset({("native", "__import__")})):
                         raise _ProofIncomplete("opaque-import")
                     for alias in node.names:
-                        if alias.name != "builtins":
+                        if alias.name not in ("builtins", "contextlib"):
                             raise _ProofIncomplete("unsupported-import")
-                        state = bind_name(alias.asname or "builtins",
-                                          _ProofEffects.namespace("module", ("builtins", 0)), state)
+                        state = bind_name(alias.asname or alias.name,
+                                          _ProofEffects.namespace("module", (alias.name, 0)), state)
+                elif isinstance(node, ast.ImportFrom):
+                    if node.level or node.module != "contextlib" or any(alias.name != "suppress" for alias in node.names) \
+                            or _ProofEffects.frame_builtin(state, "__import__") != _ProofValue(frozenset({("native", "__import__")})):
+                        raise _ProofIncomplete("unsupported-import")
+                    for alias in node.names:
+                        value, error = _ProofEffects.member(self.index, scope,
+                            _ProofEffects.namespace("module", ("contextlib", 0)), "suppress", state, attribute=True)
+                        if error is not None:
+                            if any(state.region_defined(("contextlib", 0), key) for key in (
+                                    "__name__", "__file__", "__spec__", "__class__", "__getattribute__")):
+                                raise _ProofIncomplete("contextlib-import-metadata")
+                            fields = (("name", _ProofValue.literal("contextlib")),
+                                      ("name_from", _ProofValue.literal("suppress")),
+                                      ("path", _ProofValue(frozenset({("plain-string", self.index.node_id(node))}))))
+                            state = self._implicit_error(node, "ImportError", state, stats, fields=fields)
+                            break
+                        if value.unknown or value.is_unbound or value == _ProofValue.absent():
+                            raise _ProofIncomplete("imprecise-import-member")
+                        state = bind_name(alias.asname or alias.name, value, state)
                 elif isinstance(node, ast.Delete):
                     statement_outcomes = (_ProofOutcome(state),)
                     for target in node.targets:
@@ -26433,6 +26761,329 @@ class ProofFlowTests(unittest.TestCase):
         context = _ProofContext(source, **kwargs)
         func = context.tree.body[0]
         return context, func, context.solve(func, entry=entry)
+
+    def test_suppress_import_alias_and_enter_result_and_invalid_normal_exit(self):
+        for prefix,callee in (("import contextlib as c","c.suppress"),("from contextlib import suppress as S","S")):
+            with self.subTest(prefix=prefix):
+                context,func,snapshot = self._solve(prefix+"\nwith "+callee+"(0) as entered:\n    ran=True\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                state = snapshot.exits[0]
+                self.assertEqual(state.pending.kind,"normal")
+                self.assertEqual(state.lookup(context.index.node_id(func),"entered"),_ProofValue.literal(None))
+                self.assertEqual(state.lookup(context.index.node_id(func),"ran"),_ProofValue.literal(True))
+                self.assertFalse(state.managers)
+                self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_suppress_short_circuits_nested_tuple_union_and_invalid_entries(self):
+        for entries,kind in (("ValueError,0",None),("0,ValueError","TypeError"),
+                ("(LookupError,(ValueError,0)),0",None),("LookupError|ValueError",None),
+                ("int","ValueError"),("()","ValueError"),("","ValueError")):
+            with self.subTest(entries=entries):
+                context,func,snapshot = self._solve("import contextlib\nwith contextlib.suppress("+entries+"):\n"
+                    "    raise ValueError()\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error_kind,kind)
+                self.assertEqual(snapshot.native_identity(func.body[-1].value,"int"),kind is None)
+
+    def test_suppress_reverse_exit_order_distinguishes_suppression_from_replacement(self):
+        for managers,kind in (("ValueError;0","TypeError"),("0;ValueError",None),
+                               ("TypeError;0",None),("0;TypeError","TypeError")):
+            with self.subTest(managers=managers):
+                left,right = managers.split(";")
+                context,func,snapshot = self._solve("import contextlib\nwith contextlib.suppress("+left+
+                    "),contextlib.suppress("+right+"):\n    raise ValueError()\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error_kind,kind)
+                self.assertFalse(snapshot.exits[0].managers)
+                self.assertEqual(snapshot.unreachable(func.body[-1]),kind is not None)
+
+    def test_suppress_argument_failure_unwinds_only_acquired_prefix(self):
+        for earlier,kind in (("NameError",None),("0","TypeError")):
+            with self.subTest(earlier=earlier):
+                context,func,snapshot = self._solve("import contextlib\nwith contextlib.suppress("+earlier+
+                    "),contextlib.suppress(missing):\n    body=True\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error_kind,kind)
+                self.assertTrue(snapshot.unreachable(func.body[1].body[0]))
+                self.assertFalse(snapshot.exits[0].managers)
+
+    def test_suppress_current_manager_is_entered_before_as_target_failure(self):
+        context,func,snapshot = self._solve("import contextlib\nbox={}\n"
+            "with contextlib.suppress(NameError) as box[missing]:\n    body=True\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.kind,"normal")
+        self.assertTrue(snapshot.unreachable(func.body[2].body[0]))
+        self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_suppress_restores_outer_active_and_continues_enclosing_finally(self):
+        context,func,snapshot = self._solve("import contextlib\nouter=LookupError()\ntry:\n    raise outer\n"
+            "except LookupError:\n    try:\n        with contextlib.suppress(ValueError):\n            raise ValueError()\n"
+            "    finally:\n        cleaned=True\n    raise")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        self.assertEqual(state.pending.error,_ProofEffects.single(state.lookup(context.index.node_id(func),"outer"))[1])
+        self.assertEqual(state.lookup(context.index.node_id(func),"cleaned"),_ProofValue.literal(True))
+        self.assertFalse(state.active)
+        self.assertFalse(state.managers)
+        self.assertFalse(state.continuation)
+
+    def test_suppress_return_and_inner_break_are_normal_exits_but_divergence_never_exits(self):
+        for body,pending in (("return 7","return"),("for x in iter(int,1):\n        break","normal"),
+                             ("for x in iter(int,1):\n        pass","diverge")):
+            with self.subTest(body=body):
+                context,func,snapshot = self._solve("import contextlib\nwith contextlib.suppress(0):\n    "+body+"\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                state = snapshot.exits[0]
+                self.assertEqual(state.pending.kind,pending)
+                self.assertEqual(bool(state.managers),pending=="diverge")
+                self.assertEqual(snapshot.unreachable(func.body[-1]),pending!="normal")
+
+    def test_suppress_group_partial_exit_raises_new_residual_with_original_context(self):
+        context,func,snapshot = self._solve("import contextlib\nv=ValueError()\nt=TypeError()\n"
+            "g=ExceptionGroup('g',[v,t])\nwith contextlib.suppress(ValueError):\n    raise g\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        original = _ProofEffects.single(state.lookup(owner,"g"))[1]
+        residual = state.exception_object(state.pending.error)
+        self.assertEqual(residual.children,(_ProofEffects.single(state.lookup(owner,"t"))[1],))
+        self.assertEqual(dict(residual.fields)["__context__"],state.lookup(owner,"g"))
+        self.assertFalse(state.same_exception_metadata(original,residual.payload))
+        self.assertFalse(state.managers)
+        self.assertTrue(snapshot.unreachable(func.body[-1]))
+
+    def test_suppress_group_split_validation_is_distinct_from_subclass_short_circuit(self):
+        for entries,kind in (("Exception,0",None),("ValueError|TypeError","TypeError"),
+                             ("(ValueError,TypeError)","TypeError"),("int","TypeError")):
+            with self.subTest(entries=entries):
+                context,func,snapshot = self._solve("import contextlib\nwith contextlib.suppress("+entries+"):\n"
+                    "    raise ExceptionGroup('g',[ValueError()])\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error_kind,kind)
+
+    def test_suppress_exit_reads_current_instance_entries_and_captures_exit_method(self):
+        context,func,snapshot = self._solve("from contextlib import suppress\nm=suppress(ValueError)\n"
+            "with m:\n    m._exceptions=(TypeError,)\n    raise ValueError()\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.error_kind,"ValueError")
+        context,func,snapshot = self._solve("from contextlib import suppress\nwith suppress(ValueError):\n"
+            "    suppress.__exit__=0\n    raise ValueError()\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.kind,"normal")
+        self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_suppress_unknown_classinfo_first_is_indeterminate_but_later_is_short_circuited(self):
+        for entries,complete in (("x,ValueError",False),("ValueError,x",True)):
+            with self.subTest(entries=entries):
+                context,func,snapshot = self._solve("import contextlib\nwith contextlib.suppress("+entries+"):\n"
+                    "    raise ValueError()\nmarker=int",parameters="x",entry=(
+                        _ProofState().bind(1,"x",_ProofValue(frozenset({("opaque","parameter",1,"x")}))),))
+                self.assertEqual(snapshot.complete,complete,snapshot.reasons)
+                self.assertEqual(snapshot.native_identity(func.body[-1].value,"int"),complete)
+
+    def test_suppress_normal_exit_checks_last_release_of_retained_opaque_argument(self):
+        for keep in (False,True):
+            with self.subTest(keep=keep):
+                context,func,snapshot = self._solve("import contextlib\n"+("keep=x\n" if keep else "")+
+                    "with contextlib.suppress(x):\n    x=0\nmarker=int",parameters="x",entry=(
+                        _ProofState().bind(1,"x",_ProofValue(frozenset({("opaque","parameter",1,"x")}))),))
+                self.assertEqual(snapshot.complete,keep,snapshot.reasons)
+                self.assertEqual(snapshot.native_identity(func.body[-1].value,"int"),keep)
+                if not keep:
+                    self.assertIn("opaque-release",snapshot.reasons)
+
+    def test_suppress_missing_instance_entries_raises_owned_attribute_error(self):
+        context,func,snapshot = self._solve("import contextlib\nm=contextlib.suppress(ValueError)\n"
+            "with m:\n    del m._exceptions\n    raise ValueError()")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        self.assertEqual(state.pending.error_kind,"AttributeError")
+        error = state.exception_object(state.pending.error)
+        fields = dict(error.keywords + error.fields)
+        self.assertEqual(fields["name"],_ProofValue.literal("_exceptions"))
+        self.assertEqual(fields["obj"],state.lookup(context.index.node_id(func),"m"))
+        self.assertEqual(_ProofEffects.single(fields["__context__"])[1][1],"ValueError")
+
+    def test_suppress_constructor_keywords_follow_argument_evaluation(self):
+        for expression,kind in (("contextlib.suppress(ValueError,bad=1)","TypeError"),
+                               ("contextlib.suppress(missing,bad=1)","NameError")):
+            with self.subTest(expression=expression):
+                context,func,snapshot = self._solve("import contextlib\nwith "+expression+":\n    body=True\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error_kind,kind)
+                self.assertFalse(snapshot.exits[0].managers)
+                self.assertTrue(snapshot.unreachable(func.body[1].body[0]))
+
+    def test_suppress_protocol_mutation_before_entry_and_module_rebinding_are_indeterminate(self):
+        for mutation in ("contextlib.suppress.__exit__=0","contextlib.suppress.__init__=0","contextlib.suppress=0"):
+            with self.subTest(mutation=mutation):
+                context,func,snapshot = self._solve("import contextlib\n"+mutation+
+                    "\nwith contextlib.suppress(ValueError):\n    raise ValueError()\nmarker=int")
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_new_suppress_class_union_does_not_invent_nonunionable_type_error(self):
+        context,func,snapshot = self._solve("from contextlib import suppress\nu=suppress|ValueError\nmarker=int")
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_manager_entry_rejects_malformed_namespace_without_python_exception(self):
+        for token in (("namespace","object",()),("namespace","object"),("namespace","object",("suppress",))):
+            with self.subTest(token=token):
+                context,func,snapshot = self._solve("with x:\n    pass\nmarker=int",parameters="x",entry=(
+                    _ProofState().bind(1,"x",_ProofValue(frozenset({token}))),))
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_suppress_context_budget_counts_exception_active_during_exit(self):
+        for cap,complete in ((1,False),(2,True),(3,True)):
+            with self.subTest(cap=cap):
+                context,func,snapshot = self._solve("import contextlib\nwith contextlib.suppress(ValueError):\n"
+                    "    raise ValueError()\nmarker=int",limits={"contexts":cap})
+                self.assertEqual(snapshot.complete,complete,snapshot.reasons)
+                if not complete:
+                    self.assertIn("context-budget",snapshot.reasons)
+                    self.assertFalse(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_suppress_alias_budget_counts_module_instance_and_captured_entries(self):
+        # Module binding1 + instance _exceptions edge1 + tuple/node/member2
+        # + acquired receiver root1 =5. Neither manager is a spelling guess.
+        for cap,complete in ((4,False),(5,True),(6,True)):
+            with self.subTest(cap=cap):
+                context,func,snapshot = self._solve("import contextlib\nwith contextlib.suppress(ValueError):\n"
+                    "    pass\nmarker=int",limits={"aliases":cap})
+                self.assertEqual(snapshot.complete,complete,snapshot.reasons)
+                if not complete:
+                    self.assertIn("alias-budget",snapshot.reasons)
+
+    def test_suppress_work_boundary_and_cached_queries_preserve_whole_exit_state(self):
+        body = "import contextlib\nwith contextlib.suppress(TypeError),contextlib.suppress(0):\n"
+        body += "    raise ValueError()\nmarker=int"
+        context,func,snapshot = self._solve(body)
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.kind,"normal")
+        work = snapshot.stats["steps"]
+        for cap,complete in ((work-1,False),(work,True),(work+1,True)):
+            candidate,scope,result = self._solve(body,limits={"steps":cap})
+            self.assertEqual(result.complete,complete,result.reasons)
+            before = dict(candidate.total_compute)
+            result.states_at(scope.body[1].items[0],"entry")
+            result.states_at(scope.body[1].items[1],"exit")
+            result.unreachable(scope.body[-1])
+            self.assertIs(candidate.solve(scope),result)
+            self.assertEqual(dict(candidate.total_compute),before)
+            if not complete:
+                self.assertIn("work-budget",result.reasons)
+                self.assertFalse(result.native_identity(scope.body[-1].value,"int"))
+
+    def test_suppress_owned_frame_can_enter_same_context_and_foreign_frames_are_rejected(self):
+        context = _ProofContext("def f():\n    marker=int\ndef allocate():\n    import contextlib\n"
+            "    with contextlib.suppress(ValueError):\n        pass\n")
+        func,allocate = context.tree.body
+        made = context.solve(allocate)
+        self.assertTrue(made.complete,made.reasons)
+        state = replace(made.states_at(allocate.body[1].body[0])[0],bindings=())
+        result = context.solve(func,entry=(state,))
+        self.assertTrue(result.complete,result.reasons)
+        self.assertEqual(result.exits[0].managers,state.managers)
+        self.assertTrue(result.native_identity(func.body[0].value,"int"))
+        frame = state.managers[0]
+        for position,value in ((1,0),(1,-1),(2,("namespace","object",())),(3,("stdlib-protocol","wrong")),(4,7)):
+            with self.subTest(position=position,value=value):
+                parts = list(frame)
+                parts[position] = value
+                candidate = replace(state,managers=(tuple(parts),))
+                bad = context.solve(func,entry=(candidate,))
+                self.assertFalse(bad.complete)
+                self.assertFalse(bad.native_identity(func.body[0].value,"int"))
+
+    def test_suppress_classinfo_with_abc_registry_is_not_assumed_to_miss(self):
+        context,func,snapshot = self._solve("from contextlib import suppress\nwith suppress(suppress):\n"
+            "    raise ValueError()\nmarker=int")
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_suppress_exit_resolves_builtin_and_module_dependencies_at_exit_time(self):
+        for mutation,kind in (("b.issubclass=lambda:0","TypeError"),("del b.issubclass","NameError"),
+                ("b.BaseExceptionGroup=0","TypeError"),("del b.BaseExceptionGroup","NameError"),
+                ("c.issubclass=lambda:0","TypeError"),("c.BaseExceptionGroup=0","TypeError")):
+            with self.subTest(mutation=mutation):
+                context,func,snapshot = self._solve("import builtins as b\nimport contextlib as c\n"+mutation+
+                    "\nwith c.suppress(TypeError):\n    raise ValueError()\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error_kind,kind)
+                self.assertTrue(snapshot.unreachable(func.body[-1]))
+
+    def test_suppress_rebound_group_criterion_controls_whether_split_is_called(self):
+        context,func,snapshot = self._solve("import contextlib as c\nc.BaseExceptionGroup=ValueError\n"
+            "with c.suppress(TypeError):\n    raise ValueError()\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.error_kind,"AttributeError")
+        context,func,snapshot = self._solve("import contextlib as c\ng=ExceptionGroup('g',[TypeError()])\n"
+            "c.BaseExceptionGroup=ValueError\nwith c.suppress(TypeError):\n    raise g\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        self.assertEqual(state.pending.error,_ProofEffects.single(state.lookup(context.index.node_id(func),"g"))[1])
+
+    def test_suppress_dependency_lookup_preserves_argument_failure_order_and_skipped_paths(self):
+        for mutation,kind in (("del b.issubclass","NameError"),("b.issubclass=0","AttributeError")):
+            with self.subTest(mutation=mutation):
+                context,func,snapshot = self._solve("import builtins as b\nimport contextlib as c\nm=c.suppress(ValueError)\n"
+                    +mutation+"\nwith m:\n    del m._exceptions\n    raise ValueError()")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error_kind,kind)
+        for mutation,body in (("del b.issubclass","pass"),("del b.BaseExceptionGroup","raise ValueError()")):
+            with self.subTest(skipped=mutation):
+                context,func,snapshot = self._solve("import builtins as b\nimport contextlib as c\n"+mutation+
+                    "\nwith c.suppress(ValueError):\n    "+body+"\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.kind,"normal")
+                self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_suppress_unmodeled_inherited_attributes_are_not_proven_absent(self):
+        for operation in ("m._abc_impl","m._recreate_cm","m._abc_impl=0\ndel m._abc_impl\nm._abc_impl"):
+            with self.subTest(operation=operation):
+                context,func,snapshot = self._solve("from contextlib import suppress\nm=suppress()\n"+operation+"\nmarker=int")
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_suppress_import_from_missing_member_raises_and_unknown_module_hook_is_incomplete(self):
+        context = _ProofContext("def f():\n    from contextlib import suppress\n    marker=int\n")
+        func = context.tree.body[0]
+        missing = _ProofState().write_region(("contextlib",0),"suppress",_ProofValue.absent())
+        result = context.solve(func,entry=(missing,))
+        self.assertTrue(result.complete,result.reasons)
+        self.assertEqual(result.exits[0].pending.error_kind,"ImportError")
+        self.assertTrue(result.unreachable(func.body[-1]))
+        hooked = missing.write_region(("contextlib",0),"__getattr__",_ProofValue(frozenset({("const-callable",0,0)})))
+        result = context.solve(func,entry=(hooked,))
+        self.assertFalse(result.complete)
+        self.assertFalse(result.unreachable(func.body[-1]))
+
+    def test_suppress_entry_cannot_hide_unmodeled_class_attribute_protocol(self):
+        context,func,snapshot = self._solve("from contextlib import suppress\nm=suppress()\ndel m._exceptions\n"
+            "with m:\n    raise ValueError()\nmarker=int",entry=(
+                _ProofState().write_region(("suppress-class",0),"_exceptions",
+                                          _ProofValue(frozenset({("native","ValueError")}))),))
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_missing_suppress_import_captures_name_from_name_and_string_metadata(self):
+        context = _ProofContext("def f():\n    try:\n        from contextlib import suppress\n"
+            "    except ImportError as e:\n        from_name=e.name_from\n        absent=e.name_from is None\n"
+            "        owner=e.name\n        path=e.path\n        message=e.msg\n    marker=int\n")
+        func = context.tree.body[0]
+        seed = _ProofState().write_region(("contextlib",0),"suppress",_ProofValue.absent())
+        snapshot = context.solve(func,entry=(seed,))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        self.assertEqual(state.lookup(owner,"from_name"),_ProofValue.literal("suppress"))
+        self.assertEqual(state.lookup(owner,"absent"),_ProofValue.literal(False))
+        self.assertEqual(state.lookup(owner,"owner"),_ProofValue.literal("contextlib"))
+        for name in ("path","message"):
+            self.assertEqual(_ProofEffects.single(state.lookup(owner,name))[0],"plain-string")
+        self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
 
     def test_type_union_creation_flattens_preserves_order_and_saved_classes(self):
         context,func,snapshot = self._solve("global OSError\nsaved=OSError\nu=(ValueError|IOError)|(TypeError|ValueError)\n"
