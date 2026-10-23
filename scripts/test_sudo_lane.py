@@ -6513,6 +6513,13 @@ class _ProofEffects:
 
 
 @dataclass(frozen=True)
+class _ProofRegionResult:
+    complete: bool
+    reasons: tuple
+    alternatives: tuple = ()
+
+
+@dataclass(frozen=True)
 class _ProofSnapshot:
     index: object
     scope: object
@@ -6523,6 +6530,30 @@ class _ProofSnapshot:
     exits: tuple = ()
     epoch: object = None
     observations: tuple = ()
+    region_results: object = None
+    region_origins: object = None
+
+    def outcomes(self, region, state):
+        """Look up a finished transfer for an actually observed whole input.
+
+        Historical input/output records are analysis provenance, never runtime
+        roots. Missing or hypothetical entries cannot manufacture bottom.
+        """
+        if not self.complete:
+            return _ProofRegionResult(False, self.reasons)
+        if not isinstance(state, _ProofState) or state.epoch is not self.epoch:
+            return _ProofRegionResult(False, ("foreign-state",))
+        if self.index is None or not isinstance(region, (ast.stmt, ast.expr, ast.Module)):
+            return _ProofRegionResult(False, ("foreign-region",))
+        try:
+            key = (self.index.node_id(region), state)
+        except KeyError:
+            return _ProofRegionResult(False, ("foreign-region",))
+        origin = self.region_origins.get(key) if self.region_origins is not None else None
+        alternatives = self.region_results.get(origin) if self.region_results is not None else None
+        if not alternatives:
+            return _ProofRegionResult(False, ("unobserved-region-entry",))
+        return _ProofRegionResult(True, (), alternatives)
 
     def states_at(self, node, role="before"):
         if self.index is None:
@@ -6932,7 +6963,10 @@ class _ProofContext:
         reasons = list(self._reasons)
         exits = []
         observations = []
-        stats = {"steps": 0, "states": 0, "context_depth": 0}
+        region_results = {}
+        region_origins = {}
+        stats = {"steps": 0, "states": 0, "context_depth": 0,
+                 "region_keys": 0, "region_outcomes": 0}
 
         def snapshot():
             return _ProofSnapshot(self.index, scope, not reasons,
@@ -6941,7 +6975,9 @@ class _ProofContext:
                                   MappingProxyType({key: tuple(states)
                                                     for key, states in events.items()}),
                                   tuple(dict.fromkeys(exits)), self._epoch,
-                                  tuple(dict.fromkeys(observations)))
+                                  tuple(dict.fromkeys(observations)),
+                                  MappingProxyType({key: tuple(items) for key, items in region_results.items()}),
+                                  MappingProxyType(region_origins))
 
         if reasons:
             return snapshot()
@@ -7365,6 +7401,50 @@ class _ProofContext:
 
         outcome_events = {}
 
+        def region_origin(node, incoming):
+            # Full input graphs are hashed only at charged interning/query
+            # seams. Cursors carry these finite IDs, not historical graphs;
+            # Python3.12 does not cache tuple hashes like Python3.14.
+            self._charge(stats, 2 * _ProofEffects.exception_work(incoming))
+            key = (self.index.node_id(node), incoming)
+            origin = region_origins.get(key)
+            if origin is None:
+                if stats["states"] >= self.limits["states"]:
+                    raise _ProofIncomplete("state-budget")
+                stats["states"] += 1
+                self._total_compute["states"] += 1
+                stats["region_keys"] += 1
+                origin = len(region_origins)
+                region_origins[key] = origin
+                region_results[origin] = []
+            return origin
+
+        def record_region(origin, outcome):
+            # Proof facts are excluded from runtime roots/release checks and
+            # bounded jointly with the event/transfer fact store.
+            self._charge(stats, 1 + _ProofEffects.exception_work(outcome.state,
+                () if outcome.value is None else (outcome.value,)))
+            items = region_results[origin]
+            if outcome in items:
+                return
+            if len(items) >= self.limits["alternatives"]:
+                raise _ProofIncomplete("alternative-budget")
+            if stats["states"] >= self.limits["states"]:
+                raise _ProofIncomplete("state-budget")
+            stats["states"] += 1
+            self._total_compute["states"] += 1
+            stats["region_outcomes"] += 1
+            items.append(outcome)
+
+        def statement_result(origin, outcome):
+            current = outcome.state
+            if current.exception_objects or current.collection_objects:
+                self._charge(stats, _ProofEffects.exception_work(current))
+                current = _ProofEffects.prune_exception_objects(current)
+            result = _ProofOutcome(current, observation=outcome.observation)
+            record_region(origin, result)
+            return outcome
+
         def bounded(items, event=None):
             unique = {}
             registered = outcome_events.setdefault(self.index.node_id(event), set()) \
@@ -7418,6 +7498,7 @@ class _ProofContext:
                         child_node = child.value
                         expansion = "args"
                         record(child, "before", current)
+                        expanded_origin = region_origin(child, current)
                     else:
                         child_node = child
                     for outcome in expression(child_node, current):
@@ -7436,6 +7517,9 @@ class _ProofContext:
                                     expanded = info[0]
                                 value = expanded
                                 record(child, "after", outcome.state)
+                                # The boundary retains its actual iterable;
+                                # expansion creates no claimed tuple identity.
+                                record_region(expanded_origin, outcome)
                             elif expansion == "kwargs":
                                 value = None
                             self._charge(stats, len(values) + 1)
@@ -7443,6 +7527,8 @@ class _ProofContext:
                             following.append((values + (value,), replace(outcome.state,
                                 temporaries=outcome.state.temporaries + held)))
                         else:
+                            if expansion == "args":
+                                record_region(expanded_origin, outcome)
                             abrupt += (replace(outcome, state=drop_holds(
                                 outcome.state, state.temporaries)),)
                         if len(following) + len(abrupt) > self.limits["alternatives"]:
@@ -7589,11 +7675,14 @@ class _ProofContext:
                          for part in (node.slice.lower, node.slice.upper, node.slice.step))
 
         def expression(node, state):
+            origin = region_origin(node, state)
             results = []
             for outcome in expression_inner(node, state):
                 current = drop_holds(outcome.state, state.temporaries,
                     (outcome.value,) if outcome.normal and outcome.value is not None else ())
-                results.append(replace(outcome, state=current))
+                result = replace(outcome, state=current)
+                record_region(origin, result)
+                results.append(result)
             return tuple(results)
 
         def expression_inner(node, state):
@@ -7819,11 +7908,14 @@ class _ProofContext:
 
         def target_store(target, value, state, delete=False):
             current = replace(state, temporaries=state.temporaries + (() if delete else (value,)))
+            origin = region_origin(target, current)
             results = []
             for outcome in target_store_inner(target, value, current, delete):
                 after = drop_holds(outcome.state, state.temporaries,
                     (value,) if outcome.normal and not delete else ())
-                results.append(replace(outcome, state=after))
+                result = replace(outcome, state=after)
+                record_region(origin, result)
+                results.append(result)
             return tuple(results)
 
         def target_store_inner(target, value, state, delete=False):
@@ -7943,6 +8035,13 @@ class _ProofContext:
                     state = replace(state, active=active)
                     self._check_alias_budget(state, stats)
                 exits.append(state)
+                root = next(frame for frame in cursor if frame[1] == "scope-exit")
+                record_region(root[2], _ProofOutcome(state))
+
+            def observe_regions(cursor, outcome):
+                for site, field, incoming in cursor:
+                    if field in ("after", "scope-exit"):
+                        record_region(incoming, outcome)
 
             def begin_finally(cursor, state):
                 site = cursor[-1][0]
@@ -8202,7 +8301,7 @@ class _ProofContext:
                 enqueue(cursor[:-1], current)
 
             for state in dict.fromkeys(entry):
-                enqueue(((owner, "body", 0),), state)
+                enqueue(((owner, "scope-exit", region_origin(scope, state)), (owner, "body", 0)), state)
             seen = set()
             while queue:
                 action, cursor, outcome = queue.popleft()
@@ -8213,10 +8312,12 @@ class _ProofContext:
                 if action == "observe":
                     self._charge(stats)
                     observations.append(outcome)
+                    observe_regions(cursor, outcome)
                     continue
                 if action == "dispatch":
                     self._charge(stats)
                     if state.pending.kind == "diverge":
+                        observe_regions(tuple(frame for frame in cursor if frame[1] != "scope-exit"), outcome)
                         terminal(state)  # no cleanup, restoration or release
                         continue
                     intercepted = False
@@ -8245,7 +8346,10 @@ class _ProofContext:
                                 and state.pending.target == site:
                             destination = cursor[:offset] if state.pending.kind == "break" else cursor[:offset + 1]
                             enqueue(destination, replace(state, pending=_ProofCompletion()))
-                        elif field not in ("body", "orelse", "after", "for-first", "for-next", "finalbody", "try-body-done", "with-item"):
+                        elif field == "after":
+                            record_region(position, outcome)
+                            continue
+                        elif field not in ("body", "orelse", "scope-exit", "for-first", "for-next", "finalbody", "try-body-done", "with-item"):
                             raise _ProofIncomplete("unsupported-dispatch-frame")
                         else:
                             continue
@@ -8259,6 +8363,9 @@ class _ProofContext:
                     continue
                 container_id, field, position = cursor[-1]
                 container = self.index.node_for_id(container_id)
+                if field == "scope-exit":
+                    terminal(state)
+                    continue
                 if field == "with-exit":
                     self._charge(stats)
                     leave_manager(cursor, state)
@@ -8399,6 +8506,7 @@ class _ProofContext:
                     continue
                 if field == "after":
                     record(container, "after", state)
+                    record_region(position, _ProofOutcome(state))
                     enqueue(cursor[:-1], state)
                     continue
                 if field in ("for-first", "for-next"):
@@ -8430,6 +8538,7 @@ class _ProofContext:
                 successor = cursor[:-1] + ((container_id, field, position + 1),)
                 self._charge(stats)
                 record(node, "before", state)
+                origin = region_origin(node, state)
                 statement_outcomes = None
                 if isinstance(node, (ast.Pass, ast.Global, ast.Nonlocal)):
                     pass
@@ -8463,9 +8572,9 @@ class _ProofContext:
                                 raise _ProofIncomplete("opaque-truth")
                             selected = "body" if bool(token[2]) else "orelse"
                             site = self.index.node_id(node)
-                            route(successor + ((site, "after", 0), (site, selected, 0)), outcome)
+                            route(successor + ((site, "after", origin), (site, selected, 0)), outcome)
                         else:
-                            route(successor, outcome)
+                            route(successor, statement_result(origin, outcome))
                     continue
                 elif isinstance(node, ast.For):
                     for outcome in expression(node.iter, state):
@@ -8474,9 +8583,9 @@ class _ProofContext:
                             if not token or token[:2] != ("iterator", "call-sentinel"):
                                 raise _ProofIncomplete("opaque-for-iterator")
                             site = self.index.node_id(node)
-                            route(successor + ((site, "after", 0), (site, "for-first", token)), outcome)
+                            route(successor + ((site, "after", origin), (site, "for-first", token)), outcome)
                         else:
-                            route(successor, outcome)
+                            route(successor, statement_result(origin, outcome))
                     continue
                 elif isinstance(node, (ast.Break, ast.Continue)):
                     destination = next((offset for offset in range(len(cursor) - 1, -1, -1)
@@ -8486,18 +8595,18 @@ class _ProofContext:
                     state = replace(state, pending=_ProofCompletion(
                         "break" if isinstance(node, ast.Break) else "continue", target=cursor[destination][0]))
                     record(node, "transfer", state)
-                    enqueue(successor, state)
+                    route(successor, statement_result(origin, _ProofOutcome(state)))
                     continue
                 elif isinstance(node, (ast.Try, ast.TryStar)):
                     site = self.index.node_id(node)
                     guards = ((site, "finally-enter", 0),) if node.finalbody else ()
                     if node.handlers:
                         guards += ((site, "try-body-done", 0),)
-                    enqueue(successor + ((site, "after", 0),) + guards + ((site, "body", 0),), state)
+                    enqueue(successor + ((site, "after", origin),) + guards + ((site, "body", 0),), state)
                     continue
                 elif isinstance(node, ast.With):
                     site = self.index.node_id(node)
-                    enqueue(successor + ((site, "after", 0), (site, "with-item", 0)), state)
+                    enqueue(successor + ((site, "after", origin), (site, "with-item", 0)), state)
                     continue
                 elif isinstance(node, ast.Return):
                     if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -8509,14 +8618,14 @@ class _ProofContext:
                             outcome = _ProofOutcome(replace(outcome.state, pending=_ProofCompletion(
                                 "return", value=outcome.value)))
                             record(node, "transfer", outcome.state)
-                        route(successor, outcome)
+                        route(successor, statement_result(origin, outcome))
                     continue
                 elif isinstance(node, ast.Raise):
                     if node.exc is not None:
                         nodes = (node.exc,) if node.cause is None else (node.exc, node.cause)
                         frontier, abrupt = operands(nodes, state)
                         for outcome in abrupt:
-                            route(successor, outcome)
+                            route(successor, statement_result(origin, outcome))
                         for values, current in frontier:
                             payload, error = _ProofEffects.normalize_exception(values[0], self.index.node_id(node))
                             if error is None and _ProofEffects.single(values[0])[0] == "native":
@@ -8535,7 +8644,7 @@ class _ProofContext:
                                 else replace(current, pending=_ProofCompletion("raise", payload))
                             current = drop_holds(current, state.temporaries)
                             record(node, "transfer", current)
-                            enqueue(successor, current)
+                            route(successor, statement_result(origin, _ProofOutcome(current)))
                         continue
                     if not state.active or state.active[-1] == ("no-active",):
                         state = self._implicit_error(node, "RuntimeError", state, stats)
@@ -8548,7 +8657,7 @@ class _ProofContext:
                         raise _ProofIncomplete("unknown-active-exception")
                     state = replace(state, pending=_ProofCompletion("raise", error))
                     record(node, "transfer", state)
-                    enqueue(successor, state)
+                    route(successor, statement_result(origin, _ProofOutcome(state)))
                     continue
                 elif isinstance(node, ast.Import):
                     if _ProofEffects.frame_builtin(state, "__import__") != _ProofValue(
@@ -8613,9 +8722,10 @@ class _ProofContext:
                     if outcome.normal and outcome.value is not None:
                         self._charge(stats, _ProofEffects.exception_work(outcome.state, (outcome.value,)))
                         _ProofEffects.check_dropped(outcome.state, outcome.state, (outcome.value,))
-                    if outcome.normal:
-                        record(node, "after", outcome.state)
-                    route(successor, outcome)
+                    result = statement_result(origin, outcome)
+                    if result.normal:
+                        record(node, "after", result.state)
+                    route(successor, result)
         except _ProofIncomplete as error:
             reasons.append(str(error))
         except (MemoryError, RecursionError):
@@ -26825,6 +26935,219 @@ class ProofFlowTests(unittest.TestCase):
         func = context.tree.body[0]
         return context, func, context.solve(func, entry=entry)
 
+    def test_region_outcomes_include_observed_starred_expansion_and_earlier_error(self):
+        for argument,error in (("t",None),("missing","NameError")):
+            context,func,snapshot = self._solve("t=(1,2)\nx=ValueError(*"+argument+")\nreturn x")
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            region = func.body[1].value.args[0]
+            result = snapshot.outcomes(region,snapshot.states_at(region)[0])
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual([item.state.pending.error_kind for item in result.alternatives],[error])
+            if error is None:
+                item = result.alternatives[0]
+                self.assertEqual(_ProofEffects.sequence_info(item.value,item.state)[0],
+                    (_ProofValue.literal(1),_ProofValue.literal(2)))
+
+    def test_region_outcomes_cursors_do_not_rehash_discarded_historical_graphs(self):
+        counts = []
+        for count in (1,20):
+            source = "def allocate():\n    x=["+",".join("0" for _ in range(64))+"]\n"
+            source += "def use(x):\n    x=0\n"+"    pass\n"*count
+            context = _ProofContext(source)
+            allocate,use = context.tree.body
+            made = context.solve(allocate)
+            self.assertTrue(made.complete,made.reasons)
+            initial = replace(made.exits[0],bindings=()).bind(context.index.node_id(use),"x",
+                made.exits[0].lookup(context.index.node_id(allocate),"x"))
+            observed = [0]
+            original = _ProofCollectionObject.__hash__
+            def measured(item):
+                observed[0] += 1
+                return original(item)
+            with mock.patch.object(_ProofCollectionObject,"__hash__",measured):
+                snapshot = context.solve(use,entry=(initial,))
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            counts.append(observed[0])
+        self.assertEqual(counts[1],counts[0])
+
+    def test_region_outcomes_preserve_each_observed_input_after_convergence(self):
+        context = _ProofContext("def f(x):\n    x=0\n    return x\n")
+        func = context.tree.body[0]
+        owner = context.index.node_id(func)
+        entries = tuple(_ProofState().bind(owner,"x",_ProofValue.literal(value)) for value in (1,2))
+        snapshot = context.solve(func,entry=entries)
+        self.assertTrue(callable(getattr(snapshot,"outcomes",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        for incoming in snapshot.states_at(func,"entry"):
+            result = snapshot.outcomes(func,incoming)
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual(len(result.alternatives),1)
+            self.assertEqual(result.alternatives[0].state.pending.kind,"return")
+            self.assertEqual(result.alternatives[0].state.pending.value,_ProofValue.literal(0))
+
+    def test_region_outcomes_expose_inner_error_before_outer_catcher(self):
+        context,func,snapshot = self._solve("try:\n    1/0\nexcept ZeroDivisionError:\n    caught=True\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"outcomes",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        statement = func.body[0]
+        expression = statement.body[0].value
+        local = snapshot.outcomes(expression,snapshot.states_at(expression)[0])
+        whole = snapshot.outcomes(statement,snapshot.states_at(statement)[0])
+        self.assertTrue(local.complete,local.reasons)
+        self.assertEqual([item.state.pending.error_kind for item in local.alternatives],["ZeroDivisionError"])
+        self.assertTrue(whole.complete,whole.reasons)
+        self.assertEqual([item.state.pending.kind for item in whole.alternatives],["normal"])
+        self.assertFalse(whole.alternatives[0].state.active)
+        self.assertFalse(whole.alternatives[0].state.continuation)
+        self.assertEqual(whole.alternatives[0].state.lookup(context.index.node_id(func),"caught"),_ProofValue.literal(True))
+
+    def test_region_outcomes_capture_finally_replacement_at_the_correct_boundary(self):
+        context,func,snapshot = self._solve("x=1\ntry:\n    return x\nfinally:\n    return 2\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"outcomes",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        statement = func.body[1]
+        for region,want in ((statement.body[0],1),(statement,2),(func,2)):
+            with self.subTest(region=type(region).__name__):
+                entry = snapshot.states_at(region,"entry" if region is func else "before")[0]
+                result = snapshot.outcomes(region,entry)
+                self.assertTrue(result.complete,result.reasons)
+                self.assertEqual([item.state.pending.value for item in result.alternatives],[_ProofValue.literal(want)])
+
+    def test_region_outcomes_provenance_is_not_a_runtime_reference_root(self):
+        context,func,snapshot = self._solve("try:\n    return x\nfinally:\n    x=1\n    return 2\nmarker=int",parameters="x")
+        self.assertTrue(callable(getattr(snapshot,"outcomes",None)))
+        self.assertFalse(snapshot.complete)
+        self.assertIn("opaque-release",snapshot.reasons)
+        result = snapshot.outcomes(func,snapshot.states_at(func,"entry")[0])
+        self.assertFalse(result.complete)
+        self.assertIn("opaque-release",result.reasons)
+
+    def test_region_outcomes_divergence_records_open_regions_without_cleanup(self):
+        context,func,snapshot = self._solve("try:\n    for x in iter(int,1):\n        pass\nfinally:\n    cleanup=True\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"outcomes",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        for region in (func.body[0].body[0],func.body[0],func):
+            incoming = snapshot.states_at(region,"entry" if region is func else "before")[0]
+            result = snapshot.outcomes(region,incoming)
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual([item.state.pending.kind for item in result.alternatives],["diverge"])
+            self.assertTrue(result.alternatives[0].state.lookup(context.index.node_id(func),"cleanup").is_unbound)
+
+    def test_region_outcomes_possible_divergence_remains_a_distinct_observation(self):
+        context,func,snapshot = self._solve("try:\n    print('ok')\nfinally:\n    cleanup=True\nmarker=int",diagnostic_policy=("print",))
+        self.assertTrue(callable(getattr(snapshot,"outcomes",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        for region in (func.body[0].body[0].value,func.body[0],func):
+            incoming = snapshot.states_at(region,"entry" if region is func else "before")[0]
+            result = snapshot.outcomes(region,incoming)
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual(len(result.alternatives),3)
+            self.assertEqual(sorted(item.state.pending.kind for item in result.alternatives),["normal","normal","raise"])
+            divergent = [item for item in result.alternatives if item.observation]
+            self.assertEqual(len(divergent),1)
+            self.assertTrue(divergent[0].state.lookup(context.index.node_id(func),"cleanup").is_unbound)
+
+    def test_region_outcomes_break_and_continue_destinations_precede_loop_dispatch(self):
+        context,func,snapshot = self._solve("for x in iter(int,1):\n    try:\n        continue\n    finally:\n        break\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"outcomes",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        loop = func.body[0]
+        statement = loop.body[0]
+        for region,kind in ((statement.body[0],"continue"),(statement.finalbody[0],"break"),(statement,"break"),(loop,"normal")):
+            result = snapshot.outcomes(region,snapshot.states_at(region)[0])
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual([item.state.pending.kind for item in result.alternatives],[kind])
+            if kind!="normal":
+                self.assertEqual(result.alternatives[0].state.pending.target,context.index.node_id(loop))
+
+    def test_region_outcomes_manager_exit_and_group_residual_are_local_boundaries(self):
+        for body,kind in (("with contextlib.suppress(ValueError):\n    raise ValueError()","normal"),
+                ("with contextlib.suppress(ValueError):\n    raise ExceptionGroup('g',[ValueError(),TypeError()])","raise")):
+            with self.subTest(body=body):
+                context,func,snapshot = self._solve("import contextlib\n"+body+"\nmarker=int")
+                self.assertTrue(callable(getattr(snapshot,"outcomes",None)))
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                region = func.body[1]
+                result = snapshot.outcomes(region,snapshot.states_at(region)[0])
+                self.assertTrue(result.complete,result.reasons)
+                self.assertEqual([item.state.pending.kind for item in result.alternatives],[kind])
+                self.assertFalse(result.alternatives[0].state.managers)
+                self.assertFalse(result.alternatives[0].state.active)
+
+    def test_region_outcomes_coroutine_conversion_occurs_only_at_scope_escape(self):
+        context = _ProofContext("async def f():\n    next(iter(int,0))\n")
+        func = context.tree.body[0]
+        snapshot = context.solve(func)
+        self.assertTrue(callable(getattr(snapshot,"outcomes",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        for region,error in ((func.body[0],"StopIteration"),(func,"RuntimeError")):
+            result = snapshot.outcomes(region,snapshot.states_at(region,"entry" if region is func else "before")[0])
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual([item.state.pending.error_kind for item in result.alternatives],[error])
+
+    def test_region_outcomes_query_is_immutable_lookup_only_and_rejects_unobserved_input(self):
+        context,func,snapshot = self._solve("x=1\nreturn x\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"outcomes",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        incoming = snapshot.states_at(func,"entry")[0]
+        original_cost = dict(context.total_compute)
+        for region in (func,func.body[0],func.body[1],func.body[1].value):
+            state = snapshot.states_at(region,"entry" if region is func else "before")[0]
+            result = snapshot.outcomes(region,state)
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual(snapshot.outcomes(region,state),result)
+        self.assertEqual(dict(context.total_compute),original_cost)
+        self.assertIs(context.solve(func),snapshot)
+        with self.assertRaises(TypeError):
+            snapshot.region_results[(context.index.node_id(func),incoming)] = ()
+        foreign = _ProofContext("def f():\n    pass\n")
+        for region,state in ((foreign.tree.body[0],incoming),(func,_ProofState()),
+                (func,replace(incoming,pending=_ProofCompletion("return",value=_ProofValue.literal(7)))),
+                (func.body[-1],incoming),(func,object())):
+            result = snapshot.outcomes(region,state)
+            self.assertFalse(result.complete)
+            self.assertTrue(result.reasons)
+
+    def test_region_outcomes_branch_correlations_do_not_cross_input_states(self):
+        context = _ProofContext("def f(flag):\n    if flag:\n        x=1\n    else:\n        x=2\n    return x\n")
+        func = context.tree.body[0]
+        owner = context.index.node_id(func)
+        snapshot = context.solve(func,entry=tuple(_ProofState().bind(owner,"flag",_ProofValue.literal(flag)) for flag in (False,True)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        for incoming in snapshot.states_at(func,"entry"):
+            value = 1 if incoming.lookup(owner,"flag")==_ProofValue.literal(True) else 2
+            result = snapshot.outcomes(func,incoming)
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual([item.state.pending.value for item in result.alternatives],[_ProofValue.literal(value)])
+
+    def test_region_outcomes_target_uses_actual_operand_holds_and_preserves_returned_graph(self):
+        context,func,snapshot = self._solve("x=ValueError('message')\nreturn x")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        target = func.body[0].targets[0]
+        result = snapshot.outcomes(target,snapshot.states_at(target)[0])
+        self.assertTrue(result.complete,result.reasons)
+        self.assertEqual(result.alternatives[0].state.lookup(context.index.node_id(func),"x"),result.alternatives[0].value)
+        expression = func.body[0].value
+        result = snapshot.outcomes(expression,snapshot.states_at(expression)[0])
+        self.assertTrue(result.complete,result.reasons)
+        item = result.alternatives[0]
+        error = item.state.exception_object(_ProofEffects.single(item.value)[1])
+        self.assertEqual(_ProofEffects.sequence_info(error.args_value,item.state)[0],(_ProofValue.literal("message"),))
+
+    def test_region_outcomes_except_star_reports_residual_after_target_clear(self):
+        context,func,snapshot = self._solve("g=ExceptionGroup('g',[ValueError(),TypeError()])\n"
+            "try:\n    raise g\nexcept* ValueError as e:\n    matched=True\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        region = func.body[1]
+        result = snapshot.outcomes(region,snapshot.states_at(region)[0])
+        self.assertTrue(result.complete,result.reasons)
+        state = result.alternatives[0].state
+        error = state.exception_object(state.pending.error)
+        self.assertEqual(tuple(child[1] for child in error.children),("TypeError",))
+        self.assertTrue(state.lookup(context.index.node_id(func),"e").is_unbound)
+        self.assertFalse(state.active)
+        self.assertFalse(state.continuation)
+
     def test_mixed_zero_division_converts_integer_before_zero_check(self):
         threshold = (1 << 1024) - (1 << 970)
         for delta in (-1,0,1):
@@ -29619,7 +29942,8 @@ class ProofFlowTests(unittest.TestCase):
 
     def test_incoming_collection_validation_shares_aggregate_work_budget(self):
         source = "def f(x,y):\n    pass\nfirst=(1,2)\nsecond=(3,4)\n"
-        for limit, complete in ((3, False), (30, True)):
+        # Validation+pass7; two origins2*7 each and results1+7 each.
+        for limit, complete in ((3, False), (50, False), (51, True), (52, True)):
             with self.subTest(limit=limit):
                 context = _ProofContext(source, limits={"steps": limit})
                 func = context.tree.body[0]
@@ -29639,7 +29963,8 @@ class ProofFlowTests(unittest.TestCase):
         for copied in (False, True):
             for duplicate in (False, True):
                 with self.subTest(copied=copied, duplicate=duplicate):
-                    context = _ProofContext("def f(x,y):\n    pass\nshape=(1,2)\n", limits={"steps": 5})
+                    # Shared validation+pass4, two*(origin2*7 + result1+7).
+                    context = _ProofContext("def f(x,y):\n    pass\nshape=(1,2)\n", limits={"steps": 48})
                     func = context.tree.body[0]
                     site = context.index.node_id(context.tree.body[1].value)
                     token = ("sequence", "tuple", site, (_ProofValue.literal(1).atoms, _ProofValue.literal(2).atoms), 3, 1)
@@ -29653,7 +29978,8 @@ class ProofFlowTests(unittest.TestCase):
                     self.assertTrue(snapshot.complete, snapshot.reasons)
 
     def test_collection_entry_cache_reuses_validated_whole_state(self):
-        context = _ProofContext("def f(x):\n    pass\nshape=(1,2)\n", limits={"steps": 4})
+        # Validation+pass4, two*(origin2*4 + result1+4).
+        context = _ProofContext("def f(x):\n    pass\nshape=(1,2)\n", limits={"steps": 30})
         func = context.tree.body[0]
         token = ("sequence", "tuple", context.index.node_id(context.tree.body[1].value),
                  (_ProofValue.literal(1).atoms, _ProofValue.literal(2).atoms), 3, 1)
@@ -30275,7 +30601,8 @@ class ProofStateTests(unittest.TestCase):
         self.assertEqual(state.active, (("error", "LookupError"),))
 
     def test_work_budget_boundary_never_proves_unreachable(self):
-        for limit, want in ((0, False), (1, True), (2, True)):
+        # One pass plus statement/scope facts:1+2*(origin2 + result2)=9.
+        for limit, want in ((8, False), (9, True), (10, True)):
             with self.subTest(limit=limit):
                 context = self._context("def f():\n    pass\n", limits={"steps": limit})
                 func = context.tree.body[0]
@@ -30356,7 +30683,8 @@ class ProofStateTests(unittest.TestCase):
                          _ProofValue.literal(0))
 
     def test_exact_state_and_alternative_boundaries_include_scope_entry(self):
-        for cap, complete in ((0, False), (1, True), (2, True)):
+        # Empty scope retains entry, relation key, and its output alternative.
+        for cap, complete in ((2, False), (3, True), (4, True)):
             with self.subTest(state_cap=cap):
                 snapshot = self._context("", limits={"states": cap}).solve()
                 self.assertEqual(snapshot.complete, complete)
@@ -30414,8 +30742,8 @@ class ProofStateTests(unittest.TestCase):
 
     def test_independent_query_order_and_cache_eviction_keep_results_intrinsic(self):
         source = "def f():\n    pass\ndef g():\n    pass\n"
-        left = self._context(source, limits={"steps": 1, "contexts": 0})
-        right = self._context(source, limits={"steps": 1, "contexts": 0})
+        left = self._context(source, limits={"steps": 9, "contexts": 0})
+        right = self._context(source, limits={"steps": 9, "contexts": 0})
         left_results = [left.solve(scope) for scope in left.tree.body]
         right_results = [right.solve(scope) for scope in reversed(right.tree.body)]
         for first, second in zip(left_results, reversed(right_results)):
@@ -30425,7 +30753,7 @@ class ProofStateTests(unittest.TestCase):
         evicted = left.solve(left.tree.body[0])
         self.assertEqual(evicted.stats, left_results[0].stats)
         self.assertEqual(evicted.reasons, left_results[0].reasons)
-        self.assertEqual(left.total_compute["steps"], 3)
+        self.assertEqual(left.total_compute["steps"], 27)
         self.assertEqual(len(left._cache), 1)
 
     def test_incoming_frames_names_and_binding_owners_obey_bounds(self):
