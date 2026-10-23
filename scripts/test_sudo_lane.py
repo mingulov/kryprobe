@@ -4532,8 +4532,8 @@ class _ProofCompletion:
 
 def _proof_group_key(key):
     return type(key) is tuple and len(key) == 3 and type(key[0]) is str and type(key[1]) is str \
-        and key[0] in ("split", "subgroup", "project") \
-        and key[1] in ("match", "rest") and (key[0] == "split" or key[1] == "match") \
+        and key[0] in ("split", "subgroup", "project", "star-split", "star-wrap", "star-merge") \
+        and key[1] in ("match", "rest") and (key[0] in ("split", "star-split") or key[1] == "match") \
         and type(key[2]) is tuple and len(key[2]) <= 128 \
         and all(type(index) is int and 0 <= index < 100_000 for index in key[2])
 
@@ -4559,7 +4559,7 @@ class _ProofCollectionObject:
                 or type(self.identity[2]) is not int or self.identity[2] < 0 \
                 or self.identity[3] not in ("literal", "args", "implicit-args", "captured", "empty", "slice", "args-store",
                                            "legacy-captured", "legacy-args", "derived-input", "derived-args",
-                                           "derived-captured", "split-result") \
+                                           "derived-captured", "derived-wrap-input", "split-result") \
                 or (len(self.identity) == 5) != self.identity[3].startswith("derived-") \
                 or (len(self.identity) == 5 and not _proof_group_key(self.identity[4])) \
                 or type(self.items) is not tuple or any(type(item) is not _ProofValue for item in self.items) \
@@ -4675,6 +4675,15 @@ class _ProofState:
                         or type(frame[2]) not in (str, tuple) or type(frame[3]) is not tuple \
                         or any(type(part) is not tuple for part in frame[3]):
                     raise TypeError("invalid handler restoration frame")
+            elif frame and frame[0] == "except-star":
+                if len(frame) != 9 or type(frame[1]) is not int or type(frame[2]) is not str \
+                        or frame[2] not in ("search", "body") or type(frame[3]) is not int or frame[3] < 0 \
+                        or not _proof_owned_payload(frame[4]) \
+                        or any(item is not None and not _proof_owned_payload(item) for item in (frame[5], frame[7])) \
+                        or type(frame[6]) is not tuple or len(frame[6]) > 100_000 \
+                        or any(not _proof_owned_payload(item) for item in frame[6]) \
+                        or type(frame[8]) is not tuple or any(type(item) is not tuple for item in frame[8]):
+                    raise TypeError("invalid except-star restoration frame")
         keys = set()
         for binding in self.bindings:
             if type(binding) is not tuple or len(binding) != 3:
@@ -4783,6 +4792,8 @@ class _ProofState:
                 error_roots.extend((frame[2][1], frame[3]))
             elif frame and frame[0] in ("except-search", "handler"):
                 error_roots.extend((frame[2], frame[3]))
+            elif frame and frame[0] == "except-star":
+                error_roots.extend(frame[4:])
         while error_roots:
             part = error_roots.pop()
             if type(part) not in (tuple, frozenset):
@@ -4818,6 +4829,8 @@ class _ProofState:
                 active_depth = max(active_depth, len(frame[3]) + (frame[2][0] == "raise"))
             elif frame and frame[0] in ("except-search", "handler"):
                 active_depth = max(active_depth, len(frame[3]) + 1)
+            elif frame and frame[0] == "except-star":
+                active_depth = max(active_depth, len(frame[8]) + 1)
         return active_depth + len(self.managers) + len(self.continuation)
 
 
@@ -5118,6 +5131,8 @@ class _ProofEffects:
     def exception_work(cls, state, extra=()):
         values = list(cls.exception_values(state)) + list(extra)
         count = 1 + len(state.active) + len(state.managers) + len(state.continuation)
+        count += sum(3 + len(frame[6]) + len(frame[8]) for frame in state.continuation
+                     if frame and frame[0] == "except-star")
         for item in state.exception_objects:
             count += item.edge_count()
             values.extend(item.values())
@@ -5489,16 +5504,16 @@ class _ProofEffects:
         return payload, state
 
     @classmethod
-    def split_owned(cls, state, root, matcher, site, operation, charge, limits, want_rest=True):
+    def split_owned(cls, state, root, matcher, site, operation, charge, limits, want_rest=True, path_prefix=()):
         """Occurrence walk, not object memoization; no inspected callbacks.
 
         A frame holds partial match/rest children until their parent owns them.
         New objects stay in the bounded table throughout this operation. Only
         the ordinary evaluator can drop holds/prune after publishing results.
         """
-        if operation not in ("split", "subgroup", "project") or matcher[0] not in ("types", "leaves"):
+        if operation not in ("split", "subgroup", "project", "star-split") or matcher[0] not in ("types", "leaves"):
             raise _ProofIncomplete("unsupported-group-split")
-        frames = [[root, (), 0, None, None]]
+        frames = [[root, path_prefix, 0, None, None]]
         while frames:
             charge(1)
             payload, path, position, matched, residual = frames[-1]
@@ -5544,6 +5559,68 @@ class _ProofEffects:
             if result[1] is not None:
                 frames[-1][4].append(result[1])
         raise _ProofIncomplete("missing-group-split-result")
+
+    @classmethod
+    def fresh_star_group(cls, state, children, site, key, charge, limits, wrapping=False):
+        """Interpreter-created group, with metadata independent of ambient error.
+
+        A naked-match wrapper captures its exact input tuple and receives its
+        own traceback. PREP_RERAISE_STAR's multi-error group instead takes a
+        new list and retains constructor-default metadata, even while pending.
+        """
+        if not children or not _proof_group_key(key):
+            raise _ProofIncomplete("invalid-star-group")
+        charge(1 + len(children))
+        parts = tuple(state.exception_object(child) for child in children)
+        if any(part is None for part in parts):
+            raise _ProofIncomplete("unowned-group-member")
+        kind = "ExceptionGroup" if all("Exception" in cls._exception_mros[part.payload[1]] for part in parts) \
+            else "BaseExceptionGroup"
+        payload = ("native-exception", kind, site, key)
+        values = tuple(_ProofValue(frozenset({("exception", child)})) for child in children)
+        charge(4 * cls.exception_work(state, values))
+        if payload in cls.live_exception_ids(state, values):
+            raise _ProofIncomplete("repeated-group-derivation")
+        if state.alias_count() + (8 + len(children) if wrapping else 9 + 2 * len(children)) > limits["aliases"]:
+            raise _ProofIncomplete("alias-budget")
+        inputs, state = cls.allocate_collection(state, "tuple" if wrapping else "list", site, values,
+            "derived-wrap-input" if wrapping else "derived-input", key)
+        arguments = (_ProofValue.literal(""), inputs)
+        charge(4 * cls.exception_work(state, arguments))
+        args_value, state = cls.allocate_collection(state, "tuple", site, arguments, "derived-args", key)
+        captured = inputs
+        if not wrapping:
+            charge(4 * cls.exception_work(state, values))
+            captured, state = cls.allocate_collection(state, "tuple", site, values, "derived-captured", key)
+        item = _ProofExceptionObject(payload, arguments, (), (), children, arguments[0], args_value, captured, "derived")
+        objects = tuple(old for old in state.exception_objects if old.payload != payload) + (item,)
+        charge((len(objects) + len(state.exception_metadata) + 1) * (1 + len(objects).bit_length()))
+        blocks = cls._exception_partition(objects, state.exception_metadata, payload)
+        if wrapping:
+            blocks = tuple((tag, members - {payload}) for tag, members in blocks if members - {payload}) \
+                + (("raised", frozenset({payload})),)
+        return payload, replace(state, exception_objects=tuple(sorted(objects, key=lambda old: old.payload)),
+            exception_metadata=tuple(sorted(blocks, key=lambda block: (block[0], tuple(sorted(block[1]))))))
+
+    @classmethod
+    def star_matcher(cls, value, state, charge):
+        token = cls.single(value)
+        sequence = cls.sequence_info(value, state)
+        members = tuple(cls.single(item) for item in sequence[0]) if sequence is not None and token[1] == "tuple" \
+            else token[1] if token and token[0] == "exception-types" else (token,)
+        charge(1 + len(members))
+        candidates = []
+        for member in members:
+            if member and member[0] == "native" and member[1] in cls._exception_mros:
+                candidates.append(cls._exception_mros[member[1]][0])
+            elif member and member[0] != "opaque":
+                return None, "TypeError"
+            else:
+                raise _ProofIncomplete("opaque-handler-type")
+        # Generic tuple validation precedes the separate group-class ban.
+        if any("BaseExceptionGroup" in cls._exception_mros[name] for name in candidates):
+            return None, "TypeError"
+        return ("types", tuple(candidates)), None
 
     @classmethod
     def handler_match(cls, value, error, state=None):
@@ -6348,6 +6425,22 @@ class _ProofContext:
             pending.extend((child, depth + 1) for child in ast.iter_child_nodes(node))
         self.tree = tree
         self.index = _ProofScopeIndex(tree, semantic_key=semantic_key)
+        for transfer in ast.walk(tree):
+            if not isinstance(transfer, (ast.Return, ast.Break, ast.Continue)):
+                continue
+            child = transfer
+            parent = self.index.parent(child)
+            while parent is not None:
+                if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    break
+                if not isinstance(transfer, ast.Return) and isinstance(parent, (ast.For, ast.AsyncFor, ast.While)) \
+                        and child in parent.body:
+                    break
+                if isinstance(parent, ast.ExceptHandler) and isinstance(self.index.parent(parent), ast.TryStar):
+                    if "invalid-except-star-transfer" not in self._reasons:
+                        self._reasons.append("invalid-except-star-transfer")
+                    break
+                child, parent = parent, self.index.parent(parent)
         self._generators = frozenset(self.index.scope_for(node) for node in ast.walk(tree)
             if isinstance(node, (ast.Yield, ast.YieldFrom))
             and isinstance(self.index.scope_for(node), (ast.FunctionDef, ast.AsyncFunctionDef)))
@@ -6565,8 +6658,14 @@ class _ProofContext:
                 or not active(state.active) or state.managers:
             return False
         for frame in state.continuation:
-            if not frame or frame[0] not in ("finally", "except-search", "handler"):
+            if not frame or frame[0] not in ("finally", "except-search", "handler", "except-star"):
                 return False
+            if frame[0] == "except-star":
+                if not active(frame[8]) or any(not error(payload) for payload in
+                        (frame[4],) + (() if frame[5] is None else (frame[5],)) + frame[6]
+                        + (() if frame[7] is None else (frame[7],))):
+                    return False
+                continue
             if not active(frame[3]):
                 return False
             payload = frame[2][1] if frame[0] == "finally" and frame[2][0] == "raise" \
@@ -6669,11 +6768,17 @@ class _ProofContext:
                     # not semantic work; charge the same stored slots either
                     # way, once per canonical uncached entry state.
                     slots = len(state.active) + len(state.continuation)
-                    slots += sum(len(frame[3]) for frame in state.continuation)
+                    slots += sum(len(frame[8]) + 3 + len(frame[6]) if frame[0] == "except-star"
+                                 else len(frame[3]) for frame in state.continuation)
                     self._charge(stats, slots + (state.pending.kind == "raise"))
                     errors = [state.pending.error] if state.pending.kind == "raise" else []
                     active = list(state.active)
                     for frame in state.continuation:
+                        if frame[0] == "except-star":
+                            active.extend(frame[8])
+                            errors.extend(payload for payload in (frame[4], frame[5], frame[7]) + frame[6]
+                                          if payload is not None)
+                            continue
                         active.extend(frame[3])
                         if frame[0] != "finally":
                             errors.append(frame[2])
@@ -6851,11 +6956,15 @@ class _ProofContext:
                             return snapshot()
                         held.extend((child, True) for child in children)
                 for frame in state.continuation:
-                    if frame and frame[0] in ("finally", "except-search", "handler"):
+                    if frame and frame[0] in ("finally", "except-search", "handler", "except-star"):
                         try:
                             site = self.index.node_for_id(frame[1])
-                            valid = (isinstance(site, ast.Try) and bool(site.finalbody)) if frame[0] == "finally" \
+                            valid = (isinstance(site, (ast.Try, ast.TryStar)) and bool(site.finalbody)) if frame[0] == "finally" \
                                 else (isinstance(site, ast.Try) and bool(site.handlers)) if frame[0] == "except-search" \
+                                else (isinstance(site, ast.TryStar) and bool(site.handlers)
+                                    and frame[3] <= len(site.handlers)
+                                    and (frame[2] != "body" or frame[3] < len(site.handlers))
+                                    and (frame[2] != "body" or frame[7] is not None)) if frame[0] == "except-star" \
                                 else isinstance(site, ast.ExceptHandler)
                         except (KeyError, IndexError):
                             valid = False
@@ -7457,6 +7566,7 @@ class _ProofContext:
                 restoring.update(frame[0] for frame in cursor if frame[1] == "handler-next")
                 restoring.update(self.index.node_id(self.index.parent(self.index.node_for_id(frame[0])))
                                  for frame in cursor if frame[1] == "handler-resume")
+                restoring.update(frame[0] for frame in cursor if frame[1] in ("star-next", "star-body-resume"))
                 depth = state.context_depth() \
                     + sum(frame[1] == "after" and frame[0] not in restoring for frame in cursor)
                 if depth > self.limits["contexts"]:
@@ -7556,6 +7666,107 @@ class _ProofContext:
                                                ("handled-error", site))
                 enqueue(cursor[:-1], current)
 
+            def star_refs(saved):
+                return tuple(_ProofValue(frozenset({("exception", payload)}))
+                             for payload in (saved[4], saved[5], saved[7]) + saved[6] if payload is not None)
+
+            def star_frame(cursor, state):
+                if not state.continuation or state.continuation[-1][:2] != ("except-star", cursor[-1][0]):
+                    raise _ProofIncomplete("foreign-star-continuation")
+                return state.continuation[-1]
+
+            def publish_star(state, saved, updated, active):
+                current = replace(state, pending=_ProofCompletion(), active=active,
+                                  continuation=state.continuation[:-1] + (updated,))
+                dropped = star_refs(saved)
+                reserve_graph(state, dropped, passes=2)
+                _ProofEffects.check_dropped(state, current, dropped)
+                self._check_alias_budget(current, stats)
+                return current
+
+            def begin_star(cursor, state):
+                site = cursor[-1][0]
+                original = state.pending.error
+                if state.exception_object(original) is None:
+                    raise _ProofIncomplete("unowned-star-original")
+                saved = ("except-star", site, "search", 0, original, original, (), None, state.active)
+                current = replace(state, pending=_ProofCompletion(), active=state.active + (("error", original),),
+                                  continuation=state.continuation + (saved,))
+                self._check_alias_budget(current, stats)
+                enqueue(cursor[:-1] + ((site, "star-next", 0),), current)
+
+            def finish_star(cursor, state, pending):
+                saved = star_frame(cursor, state)
+                current = replace(state, pending=pending, active=saved[8], continuation=state.continuation[:-1])
+                dropped = star_refs(saved)
+                reserve_graph(state, dropped, passes=2)
+                _ProofEffects.check_dropped(state, current, dropped)
+                self._check_alias_budget(current, stats)
+                enqueue(cursor[:-1], current)
+
+            def resume_star_body(cursor, state):
+                saved = star_frame(cursor, state)
+                if saved[2] != "body":
+                    raise _ProofIncomplete("foreign-star-body")
+                if state.pending.kind not in ("normal", "raise"):
+                    raise _ProofIncomplete("invalid-except-star-transfer")
+                handler = self.index.node_for_id(saved[1]).handlers[saved[3]]
+                if handler.name is not None:
+                    state = bind_name(handler.name, _ProofValue.literal(None), state)
+                    state = bind_name(handler.name, _ProofValue.unbound(), state)
+                self._charge(stats, 1 + len(saved[6]))
+                queued = saved[6]
+                if state.pending.kind == "raise":
+                    if state.exception_object(state.pending.error) is None:
+                        raise _ProofIncomplete("unowned-star-result")
+                    queued += (state.pending.error,)
+                updated = saved[:2] + ("search", saved[3] + 1, saved[4], saved[5], queued, saved[7], saved[8])
+                current = publish_star(state, saved, updated, state.active)
+                enqueue(cursor[:-1] + ((saved[1], "star-next", updated[3]),), current)
+
+            def merge_star(cursor, state):
+                saved = star_frame(cursor, state)
+                self._charge(stats, 1 + len(saved[6]))
+                raised = saved[6] + (() if saved[5] is None else (saved[5],))
+                if not state.exception_object(saved[4]).children:
+                    if len(raised) > 1:
+                        raise _ProofIncomplete("invalid-naked-star-results")
+                    result = raised[0] if raised else None
+                else:
+                    fresh, leaves = [], set()
+                    for payload in raised:
+                        self._charge(stats, 1 + len(state.exception_metadata))
+                        if not state.same_exception_metadata(payload, saved[4]):
+                            fresh.append(payload)
+                            continue
+                        pending, seen_ids = [payload], set()
+                        while pending:
+                            self._charge(stats)
+                            child = pending.pop()
+                            if child in seen_ids:
+                                continue
+                            seen_ids.add(child)
+                            item = state.exception_object(child)
+                            if item is None:
+                                raise _ProofIncomplete("unowned-star-result")
+                            self._charge(stats, len(item.children))
+                            if item.children:
+                                pending.extend(item.children)
+                            else:
+                                leaves.add(child)
+                    if leaves:
+                        (projected, unused), state = _ProofEffects.split_owned(state, saved[4],
+                            ("leaves", frozenset(leaves)), saved[1], "project",
+                            lambda amount: self._charge(stats, amount), self.limits, want_rest=False)
+                        if projected is not None:
+                            fresh.append(projected)
+                    if len(fresh) > 1:
+                        result, state = _ProofEffects.fresh_star_group(state, tuple(fresh), saved[1],
+                            ("star-merge", "match", ()), lambda amount: self._charge(stats, amount), self.limits)
+                    else:
+                        result = fresh[0] if fresh else None
+                finish_star(cursor, state, _ProofCompletion("raise", result) if result is not None else _ProofCompletion())
+
             for state in dict.fromkeys(entry):
                 enqueue(((owner, "body", 0),), state)
             seen = set()
@@ -7582,7 +7793,14 @@ class _ProofContext:
                         elif field == "finally-resume":
                             resume_finally(cursor[:offset + 1], state)
                         elif field == "try-body-done" and state.pending.kind == "raise":
-                            begin_handlers(cursor[:offset + 1], state)
+                            if isinstance(self.index.node_for_id(site), ast.TryStar):
+                                begin_star(cursor[:offset + 1], state)
+                            else:
+                                begin_handlers(cursor[:offset + 1], state)
+                        elif field == "star-next":
+                            finish_star(cursor[:offset + 1], state, state.pending)
+                        elif field == "star-body-resume":
+                            resume_star_body(cursor[:offset + 1], state)
                         elif field == "handler-next":
                             finish_search(cursor[:offset + 1], state, state.pending)
                         elif field == "handler-resume":
@@ -7644,6 +7862,56 @@ class _ProofContext:
                                 current = bind_name(handler.name, _ProofValue(frozenset({("exception", saved[2])})), current)
                             record(handler, "entry", current)
                             enqueue(cursor[:-1] + ((site, "handler-resume", 0), (site, "body", 0)), current)
+                    continue
+                if field == "star-body-resume":
+                    self._charge(stats)
+                    resume_star_body(cursor, state)
+                    continue
+                if field == "star-next":
+                    self._charge(stats)
+                    saved = star_frame(cursor, state)
+                    if saved[2:4] != ("search", position):
+                        raise _ProofIncomplete("foreign-star-search")
+                    if position == len(container.handlers):
+                        merge_star(cursor, state)
+                        continue
+                    handler = container.handlers[position]
+                    record(handler, "before", state)
+                    for outcome in handler_expression(handler.type, state):
+                        if not outcome.normal:
+                            route(cursor, outcome)
+                            continue
+                        matcher, error = _ProofEffects.star_matcher(outcome.value, outcome.state,
+                            lambda amount: self._charge(stats, amount))
+                        if error is not None:
+                            current = self._implicit_error(handler, error, outcome.state, stats)
+                            finish_star(cursor, current, current.pending)
+                            continue
+                        matched, residual = None, saved[5]
+                        current = outcome.state
+                        if residual is not None:
+                            if current.exception_object(residual).children:
+                                (matched, residual), current = _ProofEffects.split_owned(current, residual,
+                                    matcher, container_id, "star-split", lambda amount: self._charge(stats, amount),
+                                    self.limits, path_prefix=(position,))
+                            elif any(name in _ProofEffects._exception_mros[residual[1]] for name in matcher[1]):
+                                matched, current = _ProofEffects.fresh_star_group(current, (residual,), container_id,
+                                    ("star-wrap", "match", (position,)), lambda amount: self._charge(stats, amount),
+                                    self.limits, wrapping=True)
+                                residual = None
+                        updated = saved[:2] + ("body" if matched is not None else "search",
+                            position if matched is not None else position + 1, saved[4], residual, saved[6],
+                            matched if matched is not None else saved[7], saved[8])
+                        current = publish_star(current, saved, updated,
+                            saved[8] + (("error", matched),) if matched is not None else current.active)
+                        if matched is None:
+                            enqueue(cursor[:-1] + ((container_id, "star-next", position + 1),), current)
+                        else:
+                            site = self.index.node_id(handler)
+                            if handler.name is not None:
+                                current = bind_name(handler.name, _ProofValue(frozenset({("exception", matched)})), current)
+                            record(handler, "entry", current)
+                            enqueue(cursor[:-1] + ((container_id, "star-body-resume", position), (site, "body", 0)), current)
                     continue
                 if field == "finally-enter":
                     self._charge(stats)
@@ -7722,7 +7990,7 @@ class _ProofContext:
                     record(node, "transfer", state)
                     enqueue(successor, state)
                     continue
-                elif isinstance(node, ast.Try):
+                elif isinstance(node, (ast.Try, ast.TryStar)):
                     site = self.index.node_id(node)
                     guards = ((site, "finally-enter", 0),) if node.finalbody else ()
                     if node.handlers:
@@ -26035,6 +26303,305 @@ class ProofFlowTests(unittest.TestCase):
         context = _ProofContext(source, **kwargs)
         func = context.tree.body[0]
         return context, func, context.solve(func, entry=entry)
+
+    def test_except_star_native_alias_headers_match_canonical_class_for_naked_and_grouped_errors(self):
+        for original in ("OSError()","ExceptionGroup('g',[OSError()])"):
+            for header,matched in (("IOError",True),("EnvironmentError",True),("(IOError,)",True),
+                                   ("OSError",True),("ValueError",False)):
+                with self.subTest(original=original,header=header):
+                    context,func,snapshot = self._solve("caught=False\ntry:\n    raise "+original+
+                        "\nexcept* "+header+":\n    caught=True\nmarker=int")
+                    self.assertTrue(snapshot.complete,snapshot.reasons)
+                    state = snapshot.exits[0]
+                    self.assertEqual(state.pending.kind,"normal" if matched else "raise")
+                    self.assertEqual(state.lookup(context.index.node_id(func),"caught"),_ProofValue.literal(matched))
+                    self.assertEqual(snapshot.unreachable(func.body[1].handlers[0].body[0]),not matched)
+                    self.assertEqual(snapshot.native_identity(func.body[-1].value,"int"),matched)
+
+    def test_except_star_restores_exact_outer_active_after_handling_header_failure_or_merge(self):
+        bodies = (
+            "outer=LookupError()\ntry:\n    raise outer\nexcept LookupError:\n    try:\n        raise ValueError()\n"
+            "    except* ValueError:\n        pass\n    raise",
+            "outer=LookupError()\ntry:\n    raise outer\nexcept LookupError:\n    try:\n        try:\n"
+            "            raise ValueError()\n        except* ValueError:\n            pass\n        except* missing:\n"
+            "            pass\n    except NameError:\n        pass\n    raise",
+            "outer=LookupError()\ntry:\n    raise outer\nexcept LookupError:\n    try:\n        try:\n"
+            "            raise ExceptionGroup('g',[ValueError(),TypeError()])\n        except* ValueError:\n"
+            "            raise RuntimeError()\n        except* TypeError:\n            raise\n"
+            "    except ExceptionGroup:\n        pass\n    raise")
+        for body in bodies:
+            with self.subTest(body=body):
+                context,func,snapshot = self._solve(body)
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                state = snapshot.exits[0]
+                self.assertEqual(state.pending.error,
+                    _ProofEffects.single(state.lookup(context.index.node_id(func),"outer"))[1])
+                self.assertFalse(state.active)
+                self.assertFalse(state.continuation)
+
+    def test_except_star_illegal_transfers_are_rejected_even_in_dead_source(self):
+        bodies = ("return 7\ntry:\n    pass\nexcept* ValueError:\n    return 8\nmarker=int",
+                  "for x in iter(int,0):\n    try:\n        pass\n    except* ValueError:\n        break\nmarker=int",
+                  "for x in iter(int,0):\n    try:\n        pass\n    except* ValueError:\n        continue\nmarker=int")
+        for body in bodies:
+            with self.subTest(body=body):
+                context,func,snapshot = self._solve(body)
+                self.assertFalse(snapshot.complete)
+                self.assertIn("invalid-except-star-transfer",snapshot.reasons)
+                self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_except_star_nested_function_return_does_not_cross_handler(self):
+        context,func,snapshot = self._solve("try:\n    raise ValueError()\nexcept* ValueError:\n"
+            "    def inner():\n        return 1\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_except_star_invalid_late_headers_are_checked_without_residual(self):
+        for header,expected in (("ExceptionGroup","TypeError"),("(BaseExceptionGroup,int)","TypeError"),
+                ("(ExceptionGroup,missing)","NameError"),("[ValueError]","TypeError"),("()",None)):
+            with self.subTest(header=header):
+                context,func,snapshot = self._solve("try:\n    raise ValueError()\n"
+                    "except* ValueError:\n    pass\nexcept* "+header+":\n    pass\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error_kind,expected)
+                self.assertEqual(snapshot.unreachable(func.body[-1]),expected is not None)
+
+    def test_except_star_frame_releases_original_mutated_input_at_exit(self):
+        for keep in (False,True):
+            with self.subTest(keep=keep):
+                context,func,snapshot = self._solve("v=ValueError()\nold=[v]\ng=ExceptionGroup('g',old)\n"
+                    "old[:]=[x]\n"+("keep=g\n" if keep else "")+"x=old=0\ntry:\n    raise g\n"
+                    "except* ValueError:\n    g=0\nmarker=int",parameters="x",entry=(
+                        _ProofState().bind(1,"x",_ProofValue(frozenset({("opaque","parameter",1,"x")}))),))
+                self.assertEqual(snapshot.complete,keep,snapshot.reasons)
+                self.assertEqual(snapshot.native_identity(func.body[-1].value,"int"),keep)
+                if not keep:
+                    self.assertIn("opaque-release",snapshot.reasons)
+
+    def test_except_star_header_failure_discards_queued_errors_and_checks_last_release(self):
+        for keep in (False,True):
+            with self.subTest(keep=keep):
+                context,func,snapshot = self._solve(("keep=x\n" if keep else "")+
+                    "try:\n    raise ExceptionGroup('g',[ValueError(),TypeError()])\n"
+                    "except* ValueError:\n    try:\n        raise RuntimeError(x)\n    finally:\n        x=0\n"
+                    "except* missing:\n    pass\nmarker=int",parameters="x",entry=(
+                        _ProofState().bind(1,"x",_ProofValue(frozenset({("opaque","parameter",1,"x")}))),))
+                self.assertEqual(snapshot.complete,keep,snapshot.reasons)
+                if keep:
+                    self.assertEqual(snapshot.exits[0].pending.error_kind,"NameError")
+                    self.assertTrue(snapshot.unreachable(func.body[-1]))
+                else:
+                    self.assertIn("opaque-release",snapshot.reasons)
+                    self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_except_star_divergence_skips_siblings_and_outer_finally(self):
+        context,func,snapshot = self._solve("try:\n    raise ExceptionGroup('g',[ValueError(),TypeError()])\n"
+            "except* ValueError:\n    for x in iter(int,1):\n        pass\n"
+            "except* TypeError:\n    sibling=True\nfinally:\n    cleanup=True\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.kind,"diverge")
+        for node in (func.body[0].handlers[1].body[0],func.body[0].finalbody[0],func.body[-1]):
+            self.assertTrue(snapshot.unreachable(node))
+
+    def test_except_star_entry_preserves_owned_frame_roots_and_rejects_foreign_ids(self):
+        context = _ProofContext("def f():\n    marker=int\ndef allocate():\n"
+            "    try:\n        raise ValueError()\n    except* ValueError:\n        pass\n")
+        func,allocate = context.tree.body
+        original = context.solve(allocate)
+        self.assertTrue(original.complete,original.reasons)
+        handler = allocate.body[0].handlers[0]
+        seed = replace(original.states_at(handler.body[0])[0],bindings=())
+        admitted = context.solve(func,entry=(seed,))
+        self.assertTrue(admitted.complete,admitted.reasons)
+        self.assertTrue(admitted.native_identity(func.body[0].value,"int"))
+        self.assertEqual(admitted.exits[0].continuation,seed.continuation)
+        self.assertEqual(admitted.exits[0].exception_objects,seed.exception_objects)
+        frame = seed.continuation[-1]
+        foreign = ("native-exception","ValueError",context.index.node_id(func.body[0].value))
+        for slot in (4,5,6,7):
+            parts = list(frame)
+            parts[slot] = (foreign,) if slot == 6 else foreign
+            result = context.solve(func,entry=(replace(seed,continuation=(tuple(parts),)),))
+            self.assertFalse(result.complete)
+            self.assertIn("unowned-exception-entry",result.reasons)
+        for slot,value in ((1,context.index.node_id(func)),(3,100),(2,"search")):
+            parts = list(frame)
+            parts[slot] = value
+            if slot == 2:
+                parts[3] = 100
+            result = context.solve(func,entry=(replace(seed,continuation=(tuple(parts),)),))
+            self.assertFalse(result.complete)
+            self.assertIn("foreign-continuation",result.reasons)
+
+    def test_except_star_wrapper_alias_and_context_boundaries(self):
+        # Original empty args tuple1 + exception2; star roots original,
+        # last-match and active3; wrapper input tuple2 + args3 + group4 = 15.
+        body = "try:\n    raise ValueError()\nexcept* ValueError:\n    pass\nmarker=int"
+        for cap,complete in ((14,False),(15,True),(16,True)):
+            with self.subTest(aliases=cap):
+                context,func,snapshot = self._solve(body,limits={"aliases":cap})
+                self.assertEqual(snapshot.complete,complete,snapshot.reasons)
+                self.assertEqual(snapshot.native_identity(func.body[-1].value,"int"),complete)
+                if not complete:
+                    self.assertIn("alias-budget",snapshot.reasons)
+        for cap,complete in ((1,False),(2,True),(3,True)):
+            with self.subTest(contexts=cap):
+                context,func,snapshot = self._solve(body,limits={"contexts":cap})
+                self.assertEqual(snapshot.complete,complete,snapshot.reasons)
+                if not complete:
+                    self.assertIn("context-budget",snapshot.reasons)
+
+    def test_except_star_work_boundaries_and_cached_query_permutations(self):
+        body = "try:\n    raise ExceptionGroup('g',[ValueError(),TypeError()])\n"
+        body += "except* ValueError:\n    raise RuntimeError()\nexcept* TypeError:\n    raise\nmarker=int"
+        context,func,snapshot = self._solve(body)
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        work = snapshot.stats["steps"]
+        for cap,complete in ((work-1,False),(work,True),(work+1,True)):
+            candidate,scope,result = self._solve(body,limits={"steps":cap})
+            self.assertEqual(result.complete,complete,result.reasons)
+            compute = dict(candidate.total_compute)
+            for node in (scope.body[-1],scope.body[0].handlers[1],scope.body[0].handlers[0]):
+                result.states_at(node)
+                result.unreachable(node)
+                result.native_identity(node,"int")
+            self.assertIs(candidate.solve(scope),result)
+            self.assertEqual(dict(candidate.total_compute),compute)
+            if not complete:
+                self.assertIn("work-budget",result.reasons)
+                self.assertFalse(result.unreachable(scope.body[-1]))
+
+    def test_except_star_base_group_merge_narrows_each_side_and_projects_residual_last(self):
+        context,func,snapshot = self._solve("try:\n"
+            "    raise BaseExceptionGroup('g',[SystemExit(),ValueError()])\n"
+            "except* ValueError:\n    raise RuntimeError()")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        result = state.exception_object(state.pending.error)
+        self.assertEqual(result.payload[1],"BaseExceptionGroup")
+        self.assertEqual(tuple(child[1] for child in result.children),("RuntimeError","BaseExceptionGroup"))
+        residual = state.exception_object(result.children[1])
+        self.assertEqual(tuple(child[1] for child in residual.children),("SystemExit",))
+
+    def test_except_star_same_frame_nested_dispatch_preserves_default_merge_metadata(self):
+        context,func,snapshot = self._solve("fresh=LookupError()\ntry:\n    try:\n"
+            "        raise ExceptionGroup('g',[ValueError(),TypeError()])\n"
+            "    except* ValueError:\n        raise RuntimeError()\n    except* TypeError:\n        raise\n"
+            "except* RuntimeError as caught:\n    first=caught\nexcept* TypeError as caught:\n    second=caught\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        fresh = _ProofEffects.single(state.lookup(owner,"fresh"))[1]
+        for name in ("first","second"):
+            payload = _ProofEffects.single(state.lookup(owner,name))[1]
+            self.assertTrue(state.same_exception_metadata(payload,fresh))
+        self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_except_star_splits_siblings_and_never_matches_body_replacement_error(self):
+        context,func,snapshot = self._solve("v=ValueError()\nt=TypeError()\ng=ExceptionGroup('g',[v,t])\n"
+            "try:\n    raise g\nexcept* ValueError:\n    raise RuntimeError()\n"
+            "except* RuntimeError:\n    wrong=1\nexcept* TypeError:\n    raise\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        top = state.exception_object(state.pending.error)
+        self.assertEqual(top.message,_ProofValue.literal(""))
+        self.assertEqual(tuple(child[1] for child in top.children),("RuntimeError","ExceptionGroup"))
+        self.assertEqual(state.exception_object(top.children[1]).children,
+                         (_ProofEffects.single(state.lookup(context.index.node_id(func),"t"))[1],))
+        self.assertTrue(snapshot.unreachable(func.body[3].handlers[1].body[0]))
+        self.assertTrue(snapshot.unreachable(func.body[-1]))
+
+    def test_except_star_bare_reraise_projects_original_nesting_and_duplicate_leaf_occurrences(self):
+        context,func,snapshot = self._solve("v=ValueError()\nt=TypeError()\nh=ExceptionGroup('h',[t,v])\n"
+            "g=ExceptionGroup('g',[v,h])\ntry:\n    raise g\nexcept* ValueError:\n    raise\nexcept* TypeError:\n    pass")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        v = _ProofEffects.single(state.lookup(owner,"v"))[1]
+        top = state.exception_object(state.pending.error)
+        self.assertEqual(top.message,_ProofValue.literal("g"))
+        self.assertEqual(top.children[0],v)
+        nested = state.exception_object(top.children[1])
+        self.assertEqual(nested.message,_ProofValue.literal("h"))
+        self.assertEqual(nested.children,(v,))
+        self.assertFalse(state.active)
+        self.assertFalse(state.continuation)
+
+    def test_except_star_explicit_raise_changes_reraise_metadata_even_when_caught_internally(self):
+        for operand in ("caught","g"):
+            with self.subTest(operand=operand):
+                context,func,snapshot = self._solve("g=ExceptionGroup('g',[ValueError(),TypeError()])\n"
+                    "try:\n    raise g\nexcept* ValueError as caught:\n    try:\n        raise "+operand+
+                    "\n    except ExceptionGroup:\n        pass\n    raise\nexcept* TypeError:\n    raise")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                state = snapshot.exits[0]
+                top = state.exception_object(state.pending.error)
+                self.assertEqual(top.message,_ProofValue.literal(""))
+                self.assertEqual(tuple(state.exception_object(child).children[0][1] for child in top.children),
+                                 ("ValueError","TypeError"))
+
+    def test_except_star_merge_classifies_queued_error_using_later_mutated_metadata(self):
+        context,func,snapshot = self._solve("g=ExceptionGroup('g',[ValueError(),TypeError()])\n"
+            "try:\n    raise g\nexcept* ValueError as caught:\n    saved=caught\n    raise\n"
+            "except* TypeError:\n    try:\n        raise saved\n    except ExceptionGroup:\n        pass")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        self.assertEqual(state.pending.error,_ProofEffects.single(state.lookup(context.index.node_id(func),"saved"))[1])
+
+    def test_except_star_checks_later_headers_after_empty_residual_and_uses_last_active_match(self):
+        for first in ("raise ValueError()","raise ExceptionGroup('g',[ValueError()])"):
+            with self.subTest(first=first):
+                context,func,snapshot = self._solve("try:\n    "+first+"\nexcept* ValueError as caught:\n"
+                    "    saved=caught\nexcept* missing:\n    pass\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                state = snapshot.exits[0]
+                self.assertEqual(state.pending.error_kind,"NameError")
+                self.assertEqual(dict(state.exception_object(state.pending.error).fields)["__context__"],
+                                 state.lookup(context.index.node_id(func),"saved"))
+                self.assertTrue(snapshot.unreachable(func.body[-1]))
+
+    def test_except_star_naked_exception_wraps_only_on_match_and_reuses_exact_input_tuple(self):
+        for header,matched in (("ValueError",True),("TypeError",False)):
+            with self.subTest(header=header):
+                context,func,snapshot = self._solve("original=ValueError()\ntry:\n    raise original\n"
+                    "except* "+header+" as caught:\n    raise")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                state = snapshot.exits[0]
+                original = _ProofEffects.single(state.lookup(context.index.node_id(func),"original"))[1]
+                if matched:
+                    top = state.exception_object(state.pending.error)
+                    self.assertEqual(top.children,(original,))
+                    self.assertEqual(top.message,_ProofValue.literal(""))
+                    self.assertEqual(top.arguments[1],top.captured_value)
+                    self.assertFalse(dict(top.fields))
+                    self.assertFalse(state.same_exception_metadata(top.payload,original))
+                else:
+                    self.assertEqual(state.pending.error,original)
+
+    def test_except_star_new_merge_has_fresh_default_metadata_and_not_active_handler_context(self):
+        context,func,snapshot = self._solve("fresh=LookupError()\ntry:\n"
+            "    raise ExceptionGroup('g',[ValueError(),TypeError()])\n"
+            "except* ValueError:\n    raise RuntimeError()\nexcept* TypeError:\n    raise")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        fresh = _ProofEffects.single(state.lookup(context.index.node_id(func),"fresh"))[1]
+        top = state.exception_object(state.pending.error)
+        self.assertEqual(top.message,_ProofValue.literal(""))
+        self.assertFalse(top.fields)
+        self.assertTrue(state.same_exception_metadata(fresh,top.payload))
+        self.assertEqual(_ProofEffects.single(top.arguments[1])[:2],("collection","list"))
+
+    def test_except_star_handler_target_clear_else_finally_and_inner_loop_transfer(self):
+        context,func,snapshot = self._solve("else_ran=False\ntry:\n    raise ValueError()\n"
+            "except* ValueError as caught:\n    for x in iter(int,1):\n        break\n    caught=0\n"
+            "else:\n    else_ran=True\nfinally:\n    cleaned=True\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        self.assertTrue(state.lookup(owner,"caught").is_unbound)
+        self.assertEqual(state.lookup(owner,"else_ran"),_ProofValue.literal(False))
+        self.assertEqual(state.lookup(owner,"cleaned"),_ProofValue.literal(True))
+        self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
 
     def test_group_direct_class_match_reuses_root_and_split_returns_owned_pair(self):
         context, func, snapshot = self._solve("g=ExceptionGroup('g',[ValueError()])\n"
