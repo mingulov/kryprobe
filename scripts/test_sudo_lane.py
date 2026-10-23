@@ -4378,6 +4378,32 @@ class _ProofScopeIndex:
                 outer = enclosing[outer]
         self._captures = MappingProxyType({owner: frozenset(names) for owner, names in captures.items()})
         self._cells = MappingProxyType({owner: frozenset(names) for owner, names in cells.items()})
+        event_ids = {}
+        event_counts = {owner: 0 for owner in local}
+        for site, node in nodes.items():
+            roles = []
+            # Slice is a structural selector; its actual bound expressions
+            # have events. The transfer never materializes a slice value.
+            if isinstance(node, (ast.stmt, ast.expr, ast.ExceptHandler)) and not isinstance(node, ast.Slice):
+                roles.append("before")
+            if isinstance(node, (ast.stmt, ast.expr)) and not isinstance(node, ast.Slice):
+                roles.append("transfer" if isinstance(node, (ast.Return, ast.Raise, ast.Break, ast.Continue)) else "after")
+            if isinstance(node, ast.Call):
+                roles.append("invoke")
+            if isinstance(node, ast.For):
+                roles.append("next")
+            if isinstance(node, (ast.ExceptHandler, ast.withitem)):
+                roles.append("entry")
+            if isinstance(node, ast.withitem):
+                roles.append("exit")
+            if node in local:
+                roles.extend(("entry", "exit"))
+            for role in roles:
+                event_owner = node if role in ("entry", "exit") and node in local else owners[id(node)]
+                event_ids[(site, role)] = (event_owner, event_counts[event_owner])
+                event_counts[event_owner] += 1
+        self._event_ids = MappingProxyType(event_ids)
+        self._event_counts = MappingProxyType(event_counts)
         mangled = set()
         for owner in local:
             names = self._locals[owner] | self._globals[owner] | self._nonlocals[owner] \
@@ -4406,6 +4432,11 @@ class _ProofScopeIndex:
 
     def node_id(self, node):
         return self._node_ids[id(node)]
+
+    def event_id(self, node, role):
+        if type(role) is not str:
+            raise KeyError("foreign event role")
+        return self._event_ids[(self.node_id(node), role)]
 
     def node_for_id(self, node_id):
         return self._nodes[node_id]
@@ -4852,13 +4883,31 @@ class _ProofState:
 
 
 @dataclass(frozen=True)
+class _ProofVisits:
+    may: int = 0
+    must: int = 0
+
+    def __post_init__(self):
+        if type(self.may) is not int or type(self.must) is not int \
+                or self.may < 0 or self.must < 0 or self.must & ~self.may:
+            raise TypeError("invalid immutable event visits")
+
+    def then(self, other):
+        return _ProofVisits(self.may | other.may, self.must | other.must)
+
+    def join(self, other):
+        return _ProofVisits(self.may | other.may, self.must & other.must)
+
+
+@dataclass(frozen=True)
 class _ProofOutcome:
     state: _ProofState
     value: _ProofValue | None = None
     observation: tuple | None = None
+    visits: _ProofVisits = _ProofVisits()
 
     def __post_init__(self):
-        if type(self.state) is not _ProofState or (
+        if type(self.state) is not _ProofState or type(self.visits) is not _ProofVisits or (
                 self.value is not None and type(self.value) is not _ProofValue) or (
                 self.state.pending.kind != "normal" and self.value is not None) or (
                 self.observation is not None and (
@@ -6550,6 +6599,7 @@ class _ProofSnapshot:
     region_origins: object = None
     region_quiet: object = None
     suite_bad: object = None
+    trace_complete: bool = False
 
     def quiet_prefix(self, region, state):
         """A completed universal no-error/no-observable-effect prefix fact.
@@ -6647,6 +6697,8 @@ class _ProofSnapshot:
             return False
         try:
             if self.index.scope_for(target) is not self.scope:
+                return False
+            if self.index.event_id(target, "before")[0] is not self.scope:
                 return False
         except KeyError:
             return False
@@ -7047,7 +7099,7 @@ class _ProofContext:
         active_suites = ()
         sync_origins = []
         stats = {"steps": 0, "states": 0, "context_depth": 0,
-                 "region_keys": 0, "region_outcomes": 0, "quiet_marks": 0}
+                 "region_keys": 0, "region_outcomes": 0, "quiet_marks": 0, "visit_work": 0}
 
         def snapshot():
             return _ProofSnapshot(self.index, scope, not reasons,
@@ -7483,6 +7535,44 @@ class _ProofContext:
 
         outcome_events = {}
 
+        def visit_charge(amount):
+            self._charge(stats, amount)
+            stats["visit_work"] += amount
+
+        def visit_event(node, role):
+            event_owner, position = self.index.event_id(node, role)
+            if event_owner is not scope:
+                raise _ProofIncomplete("foreign-event-owner")
+            # Reserve creation plus closed-bitmap validation before shifting.
+            visit_charge(1 + 3 * (position // 64 + 1))
+            bit = 1 << position
+            return _ProofVisits(bit, bit)
+
+        def visit_then(left, right):
+            if not left.may or not right.may:
+                visit_charge(1)
+                return right if not left.may else left
+            words = (max(left.may.bit_length(), right.may.bit_length()) + 63) // 64
+            visit_charge(1 + 4 * words)
+            return left.then(right)
+
+        def visit_join(left, right):
+            if left is right:
+                visit_charge(1)
+                return left
+            words = (max(left.may.bit_length(), right.may.bit_length()) + 63) // 64
+            visit_charge(1 + 2 * words)
+            if left == right:
+                return left
+            visit_charge(1 + 4 * words)
+            return left.join(right)
+
+        def runtime_outcome(item):
+            return item.state, item.value, item.observation
+
+        def prepend_visit(prefix, item):
+            return replace(item, visits=visit_then(prefix, item.visits))
+
         def region_origin(node, incoming):
             # Full input graphs are hashed only at charged interning/query
             # seams. Cursors carry these finite IDs, not historical graphs;
@@ -7521,8 +7611,10 @@ class _ProofContext:
             if not outcome.normal:
                 mark_interference(origin)
             items = region_results[origin]
-            if outcome in items:
-                return
+            for position, old in enumerate(items):
+                if runtime_outcome(old) == runtime_outcome(outcome):
+                    items[position] = replace(old, visits=visit_join(old.visits, outcome.visits))
+                    return
             if len(items) >= self.limits["alternatives"]:
                 raise _ProofIncomplete("alternative-budget")
             if stats["states"] >= self.limits["states"]:
@@ -7537,7 +7629,7 @@ class _ProofContext:
             if current.exception_objects or current.collection_objects:
                 self._charge(stats, _ProofEffects.exception_work(current))
                 current = _ProofEffects.prune_exception_objects(current)
-            result = _ProofOutcome(current, observation=outcome.observation)
+            result = _ProofOutcome(current, observation=outcome.observation, visits=outcome.visits)
             record_region(origin, result)
             return outcome
 
@@ -7546,11 +7638,14 @@ class _ProofContext:
             registered = outcome_events.setdefault(self.index.node_id(event), set()) \
                 if event is not None else None
             for item in items:
-                if item in unique:
+                key = runtime_outcome(item)
+                if key in unique:
+                    old = unique[key]
+                    unique[key] = replace(old, visits=visit_join(old.visits, item.visits))
                     continue
                 if len(unique) >= self.limits["alternatives"]:
                     raise _ProofIncomplete("alternative-budget")
-                if registered is not None and item not in registered \
+                if registered is not None and key not in registered \
                         and len(registered) >= self.limits["alternatives"]:
                     raise _ProofIncomplete("alternative-budget")
                 self._charge(stats)
@@ -7558,14 +7653,14 @@ class _ProofContext:
                     raise _ProofIncomplete("state-budget")
                 stats["states"] += 1
                 self._total_compute["states"] += 1
-                unique[item] = None
+                unique[key] = item
                 if registered is not None:
-                    registered.add(item)
-            return tuple(unique)
+                    registered.add(key)
+            return tuple(unique.values())
 
         def flat_map(items, transfer):
-            return bounded(successor for item in items for successor in (
-                transfer(item) if item.normal else (item,)))
+            return bounded(prepend_visit(item.visits, successor) if item.normal else successor
+                           for item in items for successor in (transfer(item) if item.normal else (item,)))
 
         def reserve_graph(state, extra=(), passes=1):
             # Reserve the complete shallow storage domain before graph walks.
@@ -7578,11 +7673,11 @@ class _ProofContext:
             return _ProofEffects.drop_temporaries(state, base, extra)
 
         def operands(nodes, state):
-            frontier = (((), state),)
+            frontier = (((), state, _ProofVisits()),)
             abrupt = ()
             for child in nodes:
                 following = []
-                for values, current in frontier:
+                for values, current, visits in frontier:
                     expansion = None
                     expanded_origin = None
                     if isinstance(child, ast.keyword):
@@ -7606,6 +7701,9 @@ class _ProofContext:
                         if expanded_origin is not None:
                             sync_origins.pop()
                     for outcome in child_results:
+                        child_visits = outcome.visits
+                        if expansion == "args":
+                            child_visits = visit_then(visit_event(child, "before"), child_visits)
                         if outcome.normal:
                             value = outcome.value
                             if expansion == "args":
@@ -7621,35 +7719,45 @@ class _ProofContext:
                                     expanded = info[0]
                                 value = expanded
                                 record(child, "after", outcome.state)
+                                child_visits = visit_then(child_visits, visit_event(child, "after"))
                                 # The boundary retains its actual iterable;
                                 # expansion creates no claimed tuple identity.
-                                record_region(expanded_origin, outcome)
+                                record_region(expanded_origin, replace(outcome, visits=child_visits))
                             elif expansion == "kwargs":
                                 value = None
                             self._charge(stats, len(values) + 1)
                             held = value if type(value) is tuple else (() if value is None else (value,))
                             following.append((values + (value,), replace(outcome.state,
-                                temporaries=outcome.state.temporaries + held)))
+                                temporaries=outcome.state.temporaries + held), visit_then(visits, child_visits)))
                         else:
                             if expansion == "args":
-                                record_region(expanded_origin, outcome)
+                                record_region(expanded_origin, replace(outcome, visits=child_visits))
                             abrupt += (replace(outcome, state=drop_holds(
-                                outcome.state, state.temporaries)),)
+                                outcome.state, state.temporaries), visits=visit_then(visits, child_visits)),)
                         if len(following) + len(abrupt) > self.limits["alternatives"]:
                             raise _ProofIncomplete("alternative-budget")
-                frontier = tuple(dict.fromkeys(following))
+                grouped = {}
+                for values, current, visits in following:
+                    key = (values, current)
+                    grouped[key] = visit_join(grouped[key], visits) if key in grouped else visits
+                frontier = tuple((values, current, visits) for (values, current), visits in grouped.items())
             return frontier, abrupt
 
-        def finish(node, result, state, error=None, arguments=None, fields=(), promote_pending=False):
+        def finish(node, result, state, error=None, arguments=None, fields=(), promote_pending=False, visits=_ProofVisits()):
             if promote_pending and state.pending.kind == "raise" and type(state.pending.error) is str:
                 error = state.pending.error
             if error:
                 state = self._implicit_error(node, error, state, stats, arguments=arguments, fields=fields)
             if state.pending.kind == "normal":
                 record(node, "after", state)
-            return (_ProofOutcome(state, result if state.pending.kind == "normal" else None),)
+                visits = visit_then(visits, visit_event(node, "after"))
+            return (_ProofOutcome(state, result if state.pending.kind == "normal" else None, visits=visits),)
 
-        def call(node, values, state):
+        def call(node, values, state, visits=_ProofVisits()):
+            prefix = visit_then(visits, visit_event(node, "invoke"))
+            return tuple(prepend_visit(prefix, item) for item in call_inner(node, values, state))
+
+        def call_inner(node, values, state):
             callee = values[0]
             arguments = expanded_arguments(node.args, values[1:1 + len(node.args)])
             keywords = tuple((keyword.arg, value) for keyword, value in zip(node.keywords, values[1 + len(node.args):])
@@ -7789,6 +7897,7 @@ class _ProofContext:
                     current = drop_holds(outcome.state, state.temporaries,
                         (outcome.value,) if outcome.normal and outcome.value is not None else ())
                     result = replace(outcome, state=current)
+                    result = prepend_visit(visit_event(node, "before"), result)
                     record_region(origin, result)
                     results.append(result)
                 return tuple(results)
@@ -7816,7 +7925,7 @@ class _ProofContext:
             elif isinstance(node, (ast.Tuple, ast.List)):
                 frontier, abrupt = operands(node.elts, state)
                 results = list(abrupt)
-                for values, current in frontier:
+                for values, current, visits in frontier:
                     values = expanded_arguments(node.elts, values)
                     self._charge(stats, 1 + len(values) + _ProofEffects.exception_work(current))
                     if not all(_ProofEffects.retained_value(value, current) for value in values):
@@ -7825,7 +7934,7 @@ class _ProofContext:
                         "tuple" if isinstance(node, ast.Tuple) else "list", self.index.node_id(node), values)
                     if current.collection_object(_ProofEffects.single(result)).depth > self.limits["depth"]:
                         raise _ProofIncomplete("value-depth-budget")
-                    results.extend(finish(node, result, current))
+                    results.extend(finish(node, result, current, visits=visits))
                 return bounded(results, node)
             elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
                 results = []
@@ -7837,23 +7946,23 @@ class _ProofContext:
                     if not token or token[0] != "literal":
                         raise _ProofIncomplete("opaque-unary-protocol")
                     if token[1] not in ("int", "bool", "float", "complex"):
-                        results.extend(finish(node, None, outcome.state, "TypeError"))
+                        results.extend(finish(node, None, outcome.state, "TypeError", visits=outcome.visits))
                     else:
                         number = (1 if token[2] else 0) if token[1] == "bool" else token[2]
-                        results.extend(finish(node, _ProofValue.literal(-number if isinstance(node.op, ast.USub) else number), outcome.state))
+                        results.extend(finish(node, _ProofValue.literal(-number if isinstance(node.op, ast.USub) else number), outcome.state, visits=outcome.visits))
                 return bounded(results, node)
             elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
                 frontier, abrupt = operands((node.left, node.right), state)
                 results = list(abrupt)
-                for values, current in frontier:
+                for values, current, visits in frontier:
                     result, error = _ProofEffects.bitwise_or(*values, self.index.node_id(node),
                         self._native_profile[0], current, lambda amount: self._charge(stats, amount), self.limits)
-                    results.extend(finish(node, result, current, error))
+                    results.extend(finish(node, result, current, error, visits=visits))
                 return bounded(results, node)
             elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)):
                 frontier, abrupt = operands((node.left, node.right), state)
                 results = list(abrupt)
-                for values, current in frontier:
+                for values, current, visits in frontier:
                     tokens = tuple(map(_ProofEffects.single, values))
                     numeric = ("int", "bool", "float", "complex") if isinstance(node.op, ast.Div) \
                         else ("int", "bool", "float")
@@ -7869,35 +7978,36 @@ class _ProofContext:
                         threshold = (1 << 1024) - (1 << 970)
                         if any(token[1] == "int" and (token[2] >= threshold or token[2] <= -threshold)
                                for token in tokens):
-                            results.extend(finish(node, None, current, "OverflowError"))
+                            results.extend(finish(node, None, current, "OverflowError", visits=visits))
                             continue
                     # Only the existing native-failure seam is needed here.
                     # No division, numeric growth or user protocol is executed.
                     if tokens[1][2] != 0:
                         raise _ProofIncomplete("unsupported-division-result")
-                    results.extend(finish(node, None, current, "ZeroDivisionError"))
+                    results.extend(finish(node, None, current, "ZeroDivisionError", visits=visits))
                 return bounded(results, node)
             elif isinstance(node, ast.Compare) and all(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops):
                 frontier, results = [], []
                 for outcome in expression(node.left, state):
                     if outcome.normal:
-                        frontier.append((outcome.value, outcome.state))
+                        frontier.append((outcome.value, outcome.state, outcome.visits))
                     else:
                         results.append(outcome)
                 for position, (op, comparator) in enumerate(zip(node.ops, node.comparators)):
                     following = []
-                    for left, current in frontier:
+                    for left, current, visits in frontier:
                         current = replace(current, temporaries=current.temporaries + (left,))
                         pairs, abrupt = operands((comparator,), current)
-                        results.extend(abrupt)
-                        for values, after in pairs:
+                        results.extend(prepend_visit(visits, item) for item in abrupt)
+                        for values, after, child_visits in pairs:
+                            combined_visits = visit_then(visits, child_visits)
                             same = _ProofEffects.identical(left, values[0], after)
                             truth = not same if isinstance(op, ast.IsNot) else same
                             if truth and position + 1 < len(node.ops):
                                 after = drop_holds(after, state.temporaries, (values[0],))
-                                following.append((values[0], after))
+                                following.append((values[0], after, combined_visits))
                             else:
-                                results.extend(finish(node, _ProofValue.literal(truth), after))
+                                results.extend(finish(node, _ProofValue.literal(truth), after, visits=combined_visits))
                     frontier = following
                 return bounded(results, node)
             elif isinstance(node, (ast.Attribute, ast.Subscript, ast.Call, ast.JoinedStr, ast.FormattedValue)):
@@ -7911,9 +8021,9 @@ class _ProofContext:
                     nodes = subscript_nodes(node) if isinstance(node, ast.Subscript) else (node.value,)
                 frontier, abrupt = operands(nodes, state)
                 results = list(abrupt)
-                for values, current in frontier:
+                for values, current, visits in frontier:
                     if isinstance(node, ast.Call):
-                        results.extend(call(node, values, current))
+                        results.extend(call(node, values, current, visits))
                         continue
                     if isinstance(node, (ast.JoinedStr, ast.FormattedValue)):
                         if isinstance(node, ast.FormattedValue):
@@ -7930,7 +8040,7 @@ class _ProofContext:
                         # Retain an exact-str category, not fabricated contents;
                         # never run a formatter or allocate exponential text.
                         result = _ProofValue(frozenset({("plain-string", self.index.node_id(node))}))
-                        results.extend(finish(node, result, current))
+                        results.extend(finish(node, result, current, visits=visits))
                         if isinstance(node, ast.FormattedValue) and atom[:2] == ("literal", "int") \
                                 and atom[2].bit_length() > 3 * sys.int_info.str_digits_check_threshold:
                             # Decimal conversion limits are configurable, even
@@ -7939,7 +8049,7 @@ class _ProofContext:
                             # larger ones retain a possible semantic ValueError.
                             # Do not run str/repr/format or assume the host's
                             # current setting remains the inspected program's.
-                            results.extend(finish(node, None, current, "ValueError"))
+                            results.extend(finish(node, None, current, "ValueError", visits=visits))
                         continue
                     if isinstance(node, ast.Subscript):
                         if (_ProofEffects.single(values[0]) or (None,))[0] == "collection":
@@ -7949,7 +8059,7 @@ class _ProofContext:
                             if result is not None and (item := current.collection_object(_ProofEffects.single(result))) is not None \
                                     and item.depth > self.limits["depth"]:
                                 raise _ProofIncomplete("value-depth-budget")
-                            results.extend(finish(node, result, current, promote_pending=True))
+                            results.extend(finish(node, result, current, promote_pending=True, visits=visits))
                             continue
                         if isinstance(node.slice, ast.Slice):
                             raise _ProofIncomplete("unsupported-namespace-slice")
@@ -7970,7 +8080,7 @@ class _ProofContext:
                             arguments = (_ProofValue.literal(key),)
                     elif error == "KeyError":
                         arguments = (values[1],)
-                    results.extend(finish(node, result, current, error, arguments, fields))
+                    results.extend(finish(node, result, current, error, arguments, fields, visits=visits))
                 return bounded(results, node)
             else:
                 raise _ProofIncomplete("unsupported-expression")
@@ -8029,6 +8139,7 @@ class _ProofContext:
                     after = drop_holds(outcome.state, state.temporaries,
                         (value,) if outcome.normal and not delete else ())
                     result = replace(outcome, state=after)
+                    result = prepend_visit(visit_event(target, "before"), result)
                     record_region(origin, result)
                     results.append(result)
                 return tuple(results)
@@ -8047,19 +8158,20 @@ class _ProofContext:
                     state = self._implicit_error(target, error, state, stats, fields=fields)
                 if state.pending.kind == "normal":
                     record(target, "after", state)
-                return bounded((_ProofOutcome(state, value if state.pending.kind == "normal" else None),), target)
+                return bounded((_ProofOutcome(state, value if state.pending.kind == "normal" else None,
+                    visits=visit_event(target, "after") if state.pending.kind == "normal" else _ProofVisits()),), target)
             elif isinstance(target, (ast.Attribute, ast.Subscript)):
                 nodes = subscript_nodes(target) if isinstance(target, ast.Subscript) else (target.value,)
                 frontier, abrupt = operands(nodes, state)
                 results = list(abrupt)
-                for values, current in frontier:
+                for values, current, visits in frontier:
                     if isinstance(target, ast.Subscript):
                         if (_ProofEffects.single(values[0]) or (None,))[0] == "collection":
                             reserve_graph(current, () if delete else (value,), passes=2)
                             mark_interference()
                             unused, current = _ProofEffects.collection_access(values[0], subscript_key(target, values), current,
                                 self._native_profile[1], value=None if delete else value, delete=delete)
-                            results.extend(finish(target, value, current, promote_pending=True))
+                            results.extend(finish(target, value, current, promote_pending=True, visits=visits))
                             continue
                         if isinstance(target.slice, ast.Slice):
                             raise _ProofIncomplete("unsupported-namespace-slice")
@@ -8096,7 +8208,8 @@ class _ProofContext:
                         current = self._implicit_error(target, error, current, stats, arguments, fields)
                     if current.pending.kind == "normal":
                         record(target, "after", current)
-                    results.append(_ProofOutcome(current, value if current.pending.kind == "normal" else None))
+                    results.append(_ProofOutcome(current, value if current.pending.kind == "normal" else None,
+                        visits=visit_then(visits, visit_event(target, "after")) if current.pending.kind == "normal" else visits))
                 return bounded(results, target)
             else:
                 raise _ProofIncomplete("unsupported-store")
@@ -8768,7 +8881,7 @@ class _ProofContext:
                         frontier, abrupt = operands(nodes, state)
                         for outcome in abrupt:
                             route(successor, statement_result(origin, outcome))
-                        for values, current in frontier:
+                        for values, current, visits in frontier:
                             payload, error = _ProofEffects.normalize_exception(values[0], self.index.node_id(node))
                             if error is None and _ProofEffects.single(values[0])[0] == "native":
                                 reserve_graph(current, passes=4)
@@ -27079,6 +27192,166 @@ class ProofFlowTests(unittest.TestCase):
         context = _ProofContext(source, **kwargs)
         func = context.tree.body[0]
         return context, func, context.solve(func, entry=entry)
+
+    def test_visit_structural_slice_cannot_gain_legacy_unreachable_proof(self):
+        context,func,snapshot = self._solve("x=[1][:]\nreturn\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertFalse(snapshot.unreachable(func.body[0].value.slice))
+        self.assertTrue(snapshot.unreachable(func.body[-1]))
+
+    def test_visit_slice_is_structural_and_actual_bounds_keep_ordered_events(self):
+        for selector,kind in (("0:1:1",None),("missing:1:1","NameError")):
+            context,func,snapshot = self._solve("x=[1]\nx["+selector+"]")
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            expression = func.body[1].value
+            for role in ("before","after"):
+                with self.assertRaises(KeyError):
+                    context.index.event_id(expression.slice,role)
+            item = snapshot.outcomes(expression,snapshot.states_at(expression)[0]).alternatives[0]
+            self.assertEqual(item.state.pending.error_kind,kind)
+            for node,want in ((expression.slice.lower,True),(expression.slice.upper,kind is None),
+                    (expression.slice.step,kind is None)):
+                number = context.index.event_id(node,"before")[1]
+                self.assertEqual(bool(item.visits.must & (1<<number)),want)
+
+    def test_visit_equal_distinct_bitmap_comparison_is_precharged_by_width(self):
+        source = "def f(x):\n    x=0\n    int('7')\n    return\n"+"    pass\n"*1000
+        context = _ProofContext(source)
+        func = context.tree.body[0]
+        owner = context.index.node_id(func)
+        entries = tuple(_ProofState().bind(owner,"x",_ProofValue.literal(n)) for n in (1,2))
+        last = [0]
+        seen = []
+        missing = []
+        original_charge = _ProofContext._charge
+        original_equal = _ProofVisits.__eq__
+        def charged(receiver,stats,amount=1):
+            last[0] = amount
+            return original_charge(receiver,stats,amount)
+        def compared(left,right):
+            if left is not right and type(right) is _ProofVisits and left.may==right.may and left.must==right.must \
+                    and left.may is not right.may and left.must is not right.must:
+                words = (max(left.may.bit_length(),right.may.bit_length())+63)//64
+                if words>1:
+                    seen.append(words)
+                    if last[0]<1+2*words:
+                        missing.append((words,last[0]))
+            return original_equal(left,right)
+        with mock.patch.object(_ProofContext,"_charge",charged),mock.patch.object(_ProofVisits,"__eq__",compared):
+            snapshot = context.solve(func,entry=entries)
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertTrue(seen)
+        self.assertFalse(missing,missing)
+
+    def test_visit_algebra_intersects_alternative_must_and_unions_sequence(self):
+        self.assertTrue(callable(getattr(_ProofVisits,"then",None)))
+        self.assertTrue(callable(getattr(_ProofVisits,"join",None)))
+        left = _ProofVisits(3,1)
+        right = _ProofVisits(6,2)
+        self.assertEqual(left.then(right),_ProofVisits(7,3))
+        self.assertEqual(left.join(right),_ProofVisits(7,0))
+        self.assertEqual(left.join(left),left)
+        self.assertEqual(_ProofVisits().then(left),left)
+        for may,must in ((False,0),(1,-1),(1,2)):
+            with self.assertRaises(TypeError):
+                _ProofVisits(may,must)
+
+    def test_visit_work_is_charged_before_bitmap_growth_and_shares_total_budget(self):
+        context,func,snapshot = self._solve("int('7')")
+        self.assertGreater(snapshot.stats.get("visit_work",0),0)
+        cost = snapshot.stats["steps"]
+        for limit,want in ((cost-1,False),(cost,True),(cost+1,True)):
+            bounded,region,result = self._solve("int('7')",limits={"steps":limit})
+            self.assertEqual(result.complete,want,result.reasons)
+            if not want:
+                self.assertIn("work-budget",result.reasons)
+                self.assertFalse(result.unreachable(region.body[0]))
+        wide,scope,result = self._solve("int('7')\nreturn\n"+"pass\n"*100)
+        self.assertTrue(result.complete,result.reasons)
+        self.assertGreater(result.stats["visit_work"],snapshot.stats["visit_work"])
+        self.assertFalse(result.trace_complete)
+
+    def test_visit_index_assigns_legal_roles_independently_of_actual_visitation(self):
+        context,func,snapshot = self._solve("int(missing)\nmarker=int")
+        self.assertTrue(callable(getattr(context.index,"event_id",None)))
+        call = func.body[0].value
+        before = context.index.event_id(call,"before")
+        invoke = context.index.event_id(call,"invoke")
+        self.assertIs(before[0],func)
+        self.assertNotEqual(before,invoke)
+        self.assertFalse(snapshot.states_at(call,"invoke"))
+        foreign = ast.Call(func=ast.Name(id="foreign",ctx=ast.Load()),args=[],keywords=[])
+        for node,role in ((call,"invkoe"),(call.args[0],"invoke"),(foreign,"before")):
+            with self.assertRaises(KeyError):
+                context.index.event_id(node,role)
+
+    def test_visit_local_call_argument_error_does_not_invent_invocation(self):
+        context,func,snapshot = self._solve("ValueError(int(missing))\nmarker=int")
+        self.assertTrue(callable(getattr(context.index,"event_id",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        outer = func.body[0].value
+        inner = outer.args[0]
+        item = snapshot.outcomes(outer,snapshot.states_at(outer)[0]).alternatives[0]
+        self.assertTrue(hasattr(item,"visits"))
+        for node,role,want in ((outer,"before",True),(outer,"invoke",False),(outer,"after",False),
+                (inner,"before",True),(inner,"invoke",False),(inner.func,"after",True),
+                (inner.args[0],"before",True),(inner.args[0],"after",False)):
+            owner,number = context.index.event_id(node,role)
+            self.assertIs(owner,func)
+            self.assertEqual(bool(item.visits.may & (1<<number)),want)
+            self.assertEqual(bool(item.visits.must & (1<<number)),want)
+
+    def test_visit_local_normal_call_records_before_invoke_and_after(self):
+        context,func,snapshot = self._solve("int('7')")
+        self.assertTrue(callable(getattr(context.index,"event_id",None)))
+        call = func.body[0].value
+        item = snapshot.outcomes(call,snapshot.states_at(call)[0]).alternatives[0]
+        self.assertTrue(hasattr(item,"visits"))
+        for node,role in ((call,"before"),(call,"invoke"),(call,"after"),(call.args[0],"after")):
+            number = context.index.event_id(node,role)[1]
+            self.assertTrue(item.visits.must & (1<<number))
+
+    def test_visit_local_diagnostic_alternatives_keep_their_own_after_event(self):
+        context,func,snapshot = self._solve("print('ok')",diagnostic_policy=("print",))
+        self.assertTrue(callable(getattr(context.index,"event_id",None)))
+        call = func.body[0].value
+        result = snapshot.outcomes(call,snapshot.states_at(call)[0])
+        self.assertTrue(result.complete,result.reasons)
+        self.assertEqual(len(result.alternatives),3)
+        for item in result.alternatives:
+            for role,want in (("before",True),("invoke",True),("after",item.normal)):
+                number = context.index.event_id(call,role)[1]
+                self.assertEqual(bool(item.visits.must & (1<<number)),want)
+
+    def test_visit_local_chained_compare_short_circuits_later_operand(self):
+        context,func,snapshot = self._solve("x=False\ny=True\nx is y is missing")
+        self.assertTrue(callable(getattr(context.index,"event_id",None)))
+        compare = func.body[-1].value
+        item = snapshot.outcomes(compare,snapshot.states_at(compare)[0]).alternatives[0]
+        for node,want in ((compare.left,True),(compare.comparators[0],True),(compare.comparators[1],False)):
+            number = context.index.event_id(node,"before")[1]
+            self.assertEqual(bool(item.visits.must & (1<<number)),want)
+
+    def test_visit_local_starred_trace_contains_iterable_and_expansion_boundaries(self):
+        context,func,snapshot = self._solve("t=(1,2)\nValueError(*t)")
+        self.assertTrue(callable(getattr(context.index,"event_id",None)))
+        starred = func.body[1].value.args[0]
+        item = snapshot.outcomes(starred,snapshot.states_at(starred)[0]).alternatives[0]
+        for node,role in ((starred,"before"),(starred,"after"),(starred.value,"before"),(starred.value,"after")):
+            number = context.index.event_id(node,role)[1]
+            self.assertTrue(item.visits.must & (1<<number))
+
+    def test_visit_local_store_retains_operand_order_without_rhs_leakage(self):
+        context,func,snapshot = self._solve("d={}\nd['x']=1")
+        self.assertTrue(callable(getattr(context.index,"event_id",None)))
+        statement = func.body[1]
+        target = statement.targets[0]
+        item = snapshot.outcomes(target,snapshot.states_at(target)[0]).alternatives[0]
+        for node,role,want in ((target,"before",True),(target,"after",True),
+                (target.value,"before",True),(target.slice,"after",True),(statement.value,"before",False)):
+            number = context.index.event_id(node,role)[1]
+            self.assertEqual(bool(item.visits.must & (1<<number)),want)
+        self.assertFalse(getattr(snapshot,"trace_complete",False))
 
     def test_quiet_query_collection_writes_and_deletes_are_observable(self):
         for write in ("x[0]=2","del x[0]","x[:]=[2]","del x[:]"):
