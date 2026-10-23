@@ -4226,7 +4226,10 @@ class _ProofScopeIndex:
         enclosing = {}
         open_namespaces = set()
         annotation_definitions = {}
-        eager = self.semantic_key[:2] < (3, 14) and not _future_annotations(tree)
+        ignored_annotation_references = set()
+        skipped_static_nodes = set()
+        future = _future_annotations(tree)
+        eager = self.semantic_key[:2] < (3, 14) and not future
 
         def scope(node, outer):
             local.setdefault(node, set())
@@ -4257,6 +4260,8 @@ class _ProofScopeIndex:
 
         def annotations(node, outer):
             for part in _def_annotations(node):
+                if future:
+                    skipped_static_nodes.update(id(child) for child in ast.walk(part))
                 if eager:
                     pending.append((part, outer))
                 else:
@@ -4279,6 +4284,16 @@ class _ProofScopeIndex:
         while pending:
             node, owner = pending.pop()
             owners[id(node)] = owner
+            if isinstance(node,ast.Assert) and sys.flags.optimize:
+                skipped_static_nodes.update(id(part) for part in ast.walk(node))
+            if isinstance(node,ast.AugAssign) and isinstance(node.target,ast.Attribute):
+                skipped_static_nodes.add(id(node.target))
+            if isinstance(node,ast.AnnAssign):
+                if node.value is None and isinstance(node.target,ast.Attribute):
+                    skipped_static_nodes.add(id(node.target))
+                if isinstance(owner,(ast.FunctionDef,ast.AsyncFunctionDef)) or future \
+                        or self.semantic_key[:2]>=(3,14) and not node.simple:
+                    skipped_static_nodes.update(id(part) for part in ast.walk(node.annotation))
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 local[owner].add(node.name)
                 parameter_scope = type_parameters(node, owner)
@@ -4308,6 +4323,19 @@ class _ProofScopeIndex:
                 scope(node, owner)
                 arguments(node.args, node, owner)
                 pending.append((node.body, node))
+                continue
+            if isinstance(node,ast.AnnAssign) and (isinstance(owner,(ast.Module,ast.ClassDef))
+                    or self.semantic_key[:2]>=(3,14)):
+                pending.append((node.target,owner))
+                if node.value is not None:
+                    pending.append((node.value,owner))
+                if eager:
+                    pending.append((node.annotation,owner))
+                else:
+                    scope(node.annotation,owner)
+                    pending.append((node.annotation,node.annotation))
+                    if future or isinstance(owner,(ast.FunctionDef,ast.AsyncFunctionDef)):
+                        ignored_annotation_references.update(id(part) for part in ast.walk(node.annotation))
                 continue
             if isinstance(node, self._comprehensions):
                 scope(node, owner)
@@ -4363,14 +4391,34 @@ class _ProofScopeIndex:
         self._nodes = MappingProxyType(nodes)
         self._enclosing = MappingProxyType(enclosing)
         self._open_namespaces = frozenset(open_namespaces)
+        static_attributes = {owner:set() for owner in local if isinstance(owner,ast.ClassDef)}
+        for node in nodes.values():
+            if not isinstance(node,ast.Attribute) or not isinstance(node.ctx,ast.Store) \
+                    or not isinstance(node.value,ast.Name) or node.value.id!="self" \
+                    or id(node) in skipped_static_nodes:
+                continue
+            # This models compiler units, not execution or generic Store nodes.
+            # Inlined comprehensions keep their enclosing compilation unit;
+            # generator expressions have their own unit.
+            unit = owners[id(node)]
+            while isinstance(unit,(ast.ListComp,ast.SetComp,ast.DictComp)):
+                unit = enclosing[unit]
+            outer = enclosing[unit]
+            while outer is not None and not isinstance(outer,ast.ClassDef):
+                outer = enclosing[outer]
+            if outer is not None:
+                static_attributes[outer].add(node.attr)
+        self._static_attributes = MappingProxyType({owner:tuple(sorted(names)) for owner,names in static_attributes.items()})
         captures = {owner: set() for owner in local}
         cells = {owner: set() for owner in local}
         references = [(owners[id(node)], node.id) for node in ast.walk(tree)
-                      if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)]
+                      if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                      and id(node) not in ignored_annotation_references]
         # The compiler requests __class__ for an ordinary super reference too,
         # even when the dynamic payload is the only textual __class__ use.
         references.extend((owners[id(node)], "__class__") for node in ast.walk(tree)
                           if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                          and id(node) not in ignored_annotation_references
                           and node.id == "super" and isinstance(owners[id(node)],
                               (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)))
         references.extend((owner, name) for owner, names in self._nonlocals.items() for name in names)
@@ -4402,8 +4450,7 @@ class _ProofScopeIndex:
         self._cells = MappingProxyType({owner: frozenset(names) for owner, names in cells.items()})
         self._definition_parts = MappingProxyType({node: (
             () if isinstance(node, ast.ClassDef) else _proof_definition_parts(node, eager))
-            for node in local if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
-            or (isinstance(node, ast.ClassDef) and all(isinstance(part, ast.Pass) for part in node.body))})
+            for node in local if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,ast.ClassDef))})
         self._invalid_deferred_annotations = frozenset(annotation_definitions[owners[id(node)]]
             for node in nodes.values() if isinstance(node, ast.NamedExpr) and owners[id(node)] in annotation_definitions)
         deferred_captures = {}
@@ -4794,7 +4841,7 @@ class _ProofCollectionObject:
                 or self.identity[0] != "collection" or self.identity[1] not in ("list", "tuple") \
                 or type(self.identity[2]) is not int or self.identity[2] < 0 \
                 or self.identity[3] not in ("literal", "args", "implicit-args", "captured", "empty", "slice", "args-store",
-                                           "legacy-captured", "legacy-args", "derived-input", "derived-args",
+                                           "legacy-captured", "legacy-args", "static-attributes", "derived-input", "derived-args",
                                            "derived-captured", "derived-wrap-input", "split-result", "suppress-args") \
                 or (len(self.identity) == 5) != self.identity[3].startswith("derived-") \
                 or (len(self.identity) == 5 and not _proof_group_key(self.identity[4])) \
@@ -5120,17 +5167,50 @@ class _ProofState:
 class _ProofVisits:
     may: int = 0
     must: int = 0
+    owned: tuple = ()
 
     def __post_init__(self):
         if type(self.may) is not int or type(self.must) is not int \
                 or self.may < 0 or self.must < 0 or self.must & ~self.may:
             raise TypeError("invalid immutable event visits")
+        if type(self.owned) is not tuple or any(type(row) is not tuple or len(row)!=3
+                or any(type(value) is not int for value in row) or row[0]<0 or row[1]<=0
+                or row[2]<0 or row[2]&~row[1] for row in self.owned) \
+                or any(left[0]>=right[0] for left,right in zip(self.owned,self.owned[1:])):
+            raise TypeError("invalid canonical event owner rows")
+
+    @property
+    def nonempty(self):
+        return bool(self.may or self.owned)
+
+    def owner_bits(self, owner):
+        return next(((may,must) for site,may,must in self.owned if site==owner),(0,0))
+
+    def merge_owners(self, other, sequence):
+        if not self.owned and not other.owned:
+            return ()
+        result = []
+        left = right = 0
+        while left<len(self.owned) or right<len(other.owned):
+            a = self.owned[left] if left<len(self.owned) else None
+            b = other.owned[right] if right<len(other.owned) else None
+            if b is None or a is not None and a[0]<b[0]:
+                result.append(a if sequence else (a[0],a[1],0))
+                left += 1
+            elif a is None or b[0]<a[0]:
+                result.append(b if sequence else (b[0],b[1],0))
+                right += 1
+            else:
+                result.append((a[0],a[1]|b[1],a[2]|b[2] if sequence else a[2]&b[2]))
+                left += 1
+                right += 1
+        return tuple(result)
 
     def then(self, other):
-        return _ProofVisits(self.may | other.may, self.must | other.must)
+        return _ProofVisits(self.may | other.may, self.must | other.must,self.merge_owners(other,True))
 
     def join(self, other):
-        return _ProofVisits(self.may | other.may, self.must & other.must)
+        return _ProofVisits(self.may | other.may, self.must & other.must,self.merge_owners(other,False))
 
 
 @dataclass(frozen=True)
@@ -6253,9 +6333,17 @@ class _ProofEffects:
         for region, rows in classes.items():
             charge(3)
             node = index._nodes.get(region[1])
-            if not isinstance(node, ast.ClassDef) or node.type_params \
-                    or not all(isinstance(part, ast.Pass) for part in node.body) \
-                    or set(rows) != {"$owned", "$base", "$module"}:
+            body = cls.owned_marker(rows.get("$body",_ProofValue.absent()))
+            if not isinstance(node, ast.ClassDef) or node.type_params:
+                raise _ProofIncomplete("unsupported-class-entry")
+            if body:
+                fields = {"field:"+index.runtime_name(node,name) for name in index.locals_for(node)} \
+                    | {"field:"+name for name in ("__qualname__","__firstlineno__","__static_attributes__","__annotations__")}
+                if not {"$owned","$body","$base","$module"}<=rows.keys() or any(
+                        key not in fields|{"$owned","$body","$base","$module"} for key in rows):
+                    raise _ProofIncomplete("unsupported-class-entry")
+            elif not all(isinstance(part, ast.Pass) for part in node.body) \
+                    or set(rows)!={"$owned","$base","$module"}:
                 raise _ProofIncomplete("unsupported-class-entry")
             base = cls.single(rows["$base"])
             if not cls.owned_marker(rows["$owned"]) or not base or len(base) != 2 \
@@ -6263,9 +6351,27 @@ class _ProofEffects:
                     or (base[1] != "object" and base[1] not in cls._exception_mros):
                 raise _ProofIncomplete("unsupported-class-entry")
             metadata = cls.single(rows["$module"])
-            if not metadata or metadata[:2] != ("literal", "str") or not cls.closed_leaf(metadata):
+            if not body and (not metadata or metadata[:2] != ("literal", "str") or not cls.closed_leaf(metadata)):
+                raise _ProofIncomplete("unsupported-class-entry")
+            if body and any(not cls.retained_value(value,state) for value in rows.values()):
+                raise _ProofIncomplete("unsupported-class-entry")
+            if body and (not cls.class_qualname(rows.get("field:__qualname__",_ProofValue.absent()))
+                    or any(not cls.class_field_value(value,state) for name,value in rows.items()
+                           if name=="$module" or name.startswith("field:"))):
                 raise _ProofIncomplete("unsupported-class-entry")
         return frozenset(classes)
+
+    @classmethod
+    def class_qualname(cls,value):
+        atom = cls.single(value)
+        return atom is not None and cls.closed_leaf(atom) and (
+            atom[0]=="plain-string" or atom[:2]==("literal","str"))
+
+    @classmethod
+    def class_field_value(cls,value,state):
+        return not value.unknown and bool(value.atoms) and cls.retained_value(value,state) and all(
+            atom[0] not in ("opaque","empty-class","unbound","absent")
+            and atom[:2]!=("namespace","object") for atom in value.atoms)
 
     @classmethod
     def iterator_next(cls, value):
@@ -6493,7 +6599,8 @@ class _ProofEffects:
         return value
 
     @classmethod
-    def lookup(cls, index, scope, state, name, dynamic=False, selected_builtins=None):
+    def lookup(cls, index, scope, state, name, dynamic=False, selected_builtins=None,
+               native_class=False, live_owners=()):
         if name == "__debug__" and not dynamic:
             return _ProofValue.literal(__debug__), None
         function = isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
@@ -6506,7 +6613,7 @@ class _ProofEffects:
             if not dynamic:
                 return value, "UnboundLocalError"
         elif isinstance(scope, ast.ClassDef) and not declared_global:
-            if index.namespace_open(scope):
+            if index.namespace_open(scope) and not native_class:
                 return _ProofValue.unknown_value("class-namespace"), None
             value = state.lookup(index.node_id(scope), name)
             if not value.is_unbound:
@@ -6526,6 +6633,8 @@ class _ProofEffects:
                     if name in index.locals_for(outer):
                         if isinstance(outer, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
                             value = state.lookup(index.node_id(outer), name)
+                            if value.is_unbound and index.node_id(outer) in live_owners:
+                                return value, "NameError"
                             return (_ProofValue.unknown_value("entry-closure")
                                     if value.is_unbound else value), None
                         if isinstance(outer, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)):
@@ -6596,6 +6705,20 @@ class _ProofEffects:
         if attribute and index.runtime_name(scope, key) != key:
             raise _ProofIncomplete("mangled-runtime-namespace")
         atom = cls.single(receiver)
+        if attribute and atom and atom[0]=="class":
+            cls.class_base(receiver,state)
+            if cls.owned_marker(state.region_value(atom,"$body")):
+                if key=="__name__":
+                    return _ProofValue.literal(index.node_for_id(atom[1]).name),None
+                if key=="__class__":
+                    return _ProofValue(frozenset({("native","type")})),None
+                if key.startswith("__") and key.endswith("__") and key not in (
+                        "__module__","__qualname__","__firstlineno__","__static_attributes__","__doc__"):
+                    raise _ProofIncomplete("unsupported-class-metatype-descriptor")
+                field = "$module" if key=="__module__" else "field:"+key
+                if state.region_defined(atom,field):
+                    return state.region_value(atom,field),None
+            raise _ProofIncomplete("unsupported-class-member")
         if attribute and atom == cls._suppress_class:
             if key not in cls._suppress_hooks:
                 raise _ProofIncomplete("unsupported-suppress-class-member")
@@ -7002,6 +7125,7 @@ class _ProofSnapshot:
     suite_bad: object = None
     trace_complete: bool = False
     region_entries: object = None
+    eager_frames: frozenset = frozenset()
 
     def must_execute(self, event, incoming=None, region=None):
         return self._route_query(event, incoming, region, None, False)
@@ -7026,7 +7150,7 @@ class _ProofSnapshot:
             site = self.index.node_id(region)
         except KeyError:
             return _ProofQueryResult(False, None, ("foreign-event-or-region",))
-        if event_owner is not self.scope:
+        if event_owner is not self.scope and self.index.node_id(event_owner) not in self.eager_frames:
             return _ProofQueryResult(False, None, ("foreign-event-owner",))
         ancestor = event
         while ancestor is not None and ancestor is not region:
@@ -7079,8 +7203,10 @@ class _ProofSnapshot:
             outcomes = self.region_results.get(origin, ())
             if not outcomes:
                 return _ProofQueryResult(False, None, ("missing-route-outcomes",))
-            answers.extend(not bool(item.visits.may & bit) if never else bool(item.visits.must & bit)
-                           for item in outcomes)
+            for item in outcomes:
+                may,must = (item.visits.may,item.visits.must) if event_owner is self.scope else \
+                    item.visits.owner_bits(self.index.node_id(event_owner))
+                answers.append(not bool(may&bit) if never else bool(must&bit))
         return _ProofQueryResult(True, all(answers))
 
     def quiet_prefix(self, region, state):
@@ -7197,10 +7323,17 @@ class _ProofSnapshot:
         if state.epoch is not self.epoch:
             return _ProofValue.unknown_value("foreign-state")
         try:
-            value, error = _ProofEffects.lookup(self.index, self.index.scope_for(node), state, name)
+            value, error = self._lookup_at(node,name,state)
             return value
         except (KeyError, AttributeError):
             return _ProofValue.unknown_value("foreign-event")
+
+    def _lookup_at(self,node,name,state):
+        owner = self.index.scope_for(node)
+        native = self.index.node_id(owner) in self.eager_frames
+        selected = state.region_value(("function",self.index.node_id(owner)),"$builtins") if native else None
+        return _ProofEffects.lookup(self.index,owner,state,name,selected_builtins=selected,
+            native_class=native,live_owners=(self.index.node_id(self.scope),))
 
     def native_identity(self, node, name):
         states = self.states_at(node)
@@ -7215,7 +7348,7 @@ class _ProofSnapshot:
             return None
         kinds = set()
         for state in states:
-            value, error = _ProofEffects.lookup(self.index, self.index.scope_for(node), state, node.id)
+            value, error = self._lookup_at(node,node.id,state)
             kinds.add(error if error else None if value.unknown else "bound")
         return next(iter(kinds)) if len(kinds) == 1 else None
 
@@ -7229,6 +7362,19 @@ class _ProofIdentityIncomplete(Exception):
 
     def __init__(self,meter):
         self.meter = meter
+
+
+@dataclass(frozen=True)
+class _ProofClassFrame:
+    caller: int
+    decorators: tuple
+    base: _ProofValue
+    holds: int
+    decorator_holds: int
+    active: tuple
+    managers: int
+    continuation: int
+    body_origin: int = -1
 
 
 class _ProofContext:
@@ -7274,11 +7420,13 @@ class _ProofContext:
         self._scope_entry_modes = MappingProxyType({})
         self._generators = frozenset()
         self._class_entry_defaults = MappingProxyType({})
+        self._class_annotations = MappingProxyType({})
         self._reasons = []
         self._epoch = object()  # once per source, never once per loop visit
         self._cache = {}
         self._dynamic_cache = {}
         self._identity_work = 0
+        self._future = False
         self._total_compute = {"steps": 0, "states": 0, "requests": 0, "dynamic_parses": 0}
         if len(source.encode("utf-8")) > self.limits["source_bytes"]:
             self._reasons.append("source-budget")
@@ -7291,11 +7439,16 @@ class _ProofContext:
         except (MemoryError, RecursionError):
             self._reasons.append("parse-resource-failure")
             return
+        self._future = _future_annotations(tree)
         pending = [(tree, 1)]
         count = 0
         while pending:
             node, depth = pending.pop()
             count += 1
+            if isinstance(node,ast.AnnAssign) and (annotation_key[:2]>=(3,14) or self._future) \
+                    and any(isinstance(part,ast.NamedExpr) for part in ast.walk(node.annotation)) \
+                    and "invalid-annotation-binding" not in self._reasons:
+                self._reasons.append("invalid-annotation-binding")
             if count > self.limits["nodes"]:
                 self._reasons.append("node-budget")
                 return
@@ -7350,6 +7503,11 @@ class _ProofContext:
                 [scope.lineno] + [decorator.lineno for decorator in scope.decorator_list]))),)
                if annotation_key[:2] >= (3, 13) else ())
             for scope in self.index._locals if isinstance(scope, ast.ClassDef)})
+        annotated = {scope:[] for scope in self._class_entry_defaults}
+        for node in self.index._nodes.values():
+            if isinstance(node,ast.AnnAssign) and self.index.scope_for(node) in annotated:
+                annotated[self.index.scope_for(node)].append(node)
+        self._class_annotations = MappingProxyType({scope:tuple(nodes) for scope,nodes in annotated.items()})
         self._entry_modes, self._scope_entry_modes = _ProofEffects.deferred_entry_modes(self.index)
         if any(len(names | self.index.globals_for(owner)
                    | self.index.nonlocals_for(owner)) > self.limits["names"]
@@ -7723,6 +7881,9 @@ class _ProofContext:
 
     def _solve(self, scope=None, entry=None):
         scope = self.tree if scope is None else scope
+        root_scope = scope
+        current_frame = None
+        eager_frames = set()
         events = {}
         reasons = list(self._reasons)
         exits = []
@@ -7743,7 +7904,7 @@ class _ProofContext:
                  "route_points": 0, "route_slots": 0}
 
         def snapshot():
-            return _ProofSnapshot(self.index, scope, not reasons,
+            return _ProofSnapshot(self.index, root_scope, not reasons,
                                   tuple(dict.fromkeys(reasons)),
                                   MappingProxyType(dict(stats)),
                                   MappingProxyType({key: tuple(states)
@@ -7753,7 +7914,8 @@ class _ProofContext:
                                   MappingProxyType({key: tuple(items) for key, items in region_results.items()}),
                                   MappingProxyType(region_origins),
                                   MappingProxyType(region_quiet), MappingProxyType(suite_bad), trace_complete,
-                                  MappingProxyType({key: tuple(items) for key, items in region_entries.items()}))
+                                  MappingProxyType({key: tuple(items) for key, items in region_entries.items()}),
+                                  frozenset(eager_frames))
 
         if reasons:
             return snapshot()
@@ -7898,6 +8060,10 @@ class _ProofContext:
                         allocation = parent = None
                     if identity[3] == "empty":
                         valid = identity == ("collection", "tuple", 0, "empty") and not item.items
+                    elif identity[3]=="static-attributes":
+                        valid = self.semantic_key[1][:2]>=(3,13) and identity[1]=="tuple" \
+                            and isinstance(allocation,ast.ClassDef) and item.items==tuple(
+                                _ProofValue.literal(name) for name in self.index._static_attributes[allocation])
                     elif identity[3] == "literal":
                         valid = isinstance(allocation, ast.Tuple if identity[1] == "tuple" else ast.List)
                     elif identity[3] == "slice":
@@ -8231,19 +8397,24 @@ class _ProofContext:
 
         def visit_event(node, role):
             event_owner, position = self.index.event_id(node, role)
-            if event_owner is not scope:
+            if event_owner is not root_scope and self.index.node_id(event_owner) not in eager_frames:
                 raise _ProofIncomplete("foreign-event-owner")
             # Reserve creation plus closed-bitmap validation before shifting.
             visit_charge(1 + 3 * (position // 64 + 1))
             bit = 1 << position
-            return _ProofVisits(bit, bit)
+            return _ProofVisits(bit, bit) if event_owner is root_scope else \
+                _ProofVisits(owned=((self.index.node_id(event_owner),bit,bit),))
+
+        def owner_visit_work(left,right):
+            rows = left.owned+right.owned
+            return len(rows)+sum((may.bit_length()+63)//64 for unused,may,must in rows)
 
         def visit_then(left, right):
-            if not left.may or not right.may:
+            if not left.nonempty or not right.nonempty:
                 visit_charge(1)
-                return right if not left.may else left
+                return right if not left.nonempty else left
             words = (max(left.may.bit_length(), right.may.bit_length()) + 63) // 64
-            visit_charge(1 + 4 * words)
+            visit_charge(1 + 4 * words + 4 * owner_visit_work(left,right))
             return left.then(right)
 
         def visit_join(left, right):
@@ -8251,10 +8422,10 @@ class _ProofContext:
                 visit_charge(1)
                 return left
             words = (max(left.may.bit_length(), right.may.bit_length()) + 63) // 64
-            visit_charge(1 + 2 * words)
+            visit_charge(1 + 2 * words + 2 * owner_visit_work(left,right))
             if left == right:
                 return left
-            visit_charge(1 + 4 * words)
+            visit_charge(1 + 4 * words + 4 * owner_visit_work(left,right))
             return left.join(right)
 
         def runtime_outcome(item):
@@ -8587,6 +8758,86 @@ class _ProofContext:
             return tuple(item for child, value in zip(nodes, values)
                          for item in (value if isinstance(child, ast.Starred) else (value,)))
 
+        def frame_builtin(state,name):
+            if current_frame is None:
+                return _ProofEffects.frame_builtin(state,name)
+            selected = state.region_value(("function",owner),"$builtins")
+            return _ProofEffects.captured_builtin(self.index,scope,state,selected,name)
+
+        def annotation_setup(current):
+            if isinstance(scope,ast.ClassDef) and self._class_annotations[scope] \
+                    and (self.semantic_key[1][:2]<(3,14) or self._future) \
+                    and current.lookup(owner,"__annotations__").is_unbound:
+                if current_frame is None and self.index.namespace_open(scope):
+                    raise _ProofIncomplete("open-class-annotation-setup")
+                # SETUP_ANNOTATIONS writes LOCALS directly, irrespective of a
+                # global/nonlocal declaration of this spelling.
+                names = {name for storage,name,value in current.bindings if storage==owner} \
+                    |self.index.locals_for(scope)|self.index.globals_for(scope)|self.index.nonlocals_for(scope)|{"__annotations__"}
+                if len(names)>self.limits["names"]:
+                    raise _ProofIncomplete("name-budget")
+                region = ("mapping",owner)
+                value = _ProofEffects.fresh_namespace("mapping",region,current)
+                current = current.bind(owner,"__annotations__",value)
+                self._check_alias_budget(current,stats)
+            return current
+
+        def annotation_mapping(current):
+            # The compiler emits LOAD_NAME here, even when a declaration makes
+            # ordinary source reads of __annotations__ global/nonlocal.
+            value = current.lookup(owner,"__annotations__")
+            if value.is_unbound or value==_ProofValue.absent():
+                value = _ProofEffects.region_value(self.index,scope,current,("globals",0),"__annotations__")
+                if value==_ProofValue.absent():
+                    value = frame_builtin(current,"__annotations__")
+            if value.unknown or value.is_unbound:
+                raise _ProofIncomplete("imprecise-annotation-mapping")
+            return value,"NameError" if value==_ProofValue.absent() else None
+
+        def annotation_statement(node,current):
+            if isinstance(scope,ast.Module):
+                raise _ProofIncomplete("unsupported-module-annotations")
+            if node.value is not None:
+                frontier = flat_map(expression(node.value,current),lambda item:
+                    target_store(node.target,item.value,item.state))
+            elif isinstance(node.target,(ast.Attribute,ast.Subscript)):
+                nodes = (node.target.value,) if isinstance(node.target,ast.Attribute) else subscript_nodes(node.target)
+                normal,abrupt = operands(nodes,current)
+                frontier = tuple(abrupt)+tuple(_ProofOutcome(drop_holds(state,current.temporaries),visits=visits)
+                                               for values,state,visits in normal)
+            else:
+                frontier = (_ProofOutcome(current),)
+            if isinstance(scope,(ast.FunctionDef,ast.AsyncFunctionDef)):
+                return frontier  # Function-local annotations do not execute.
+            results = []
+            deferred = self.semantic_key[1][:2]>=(3,14) and not self._future
+            for item in frontier:
+                if not item.normal or deferred:
+                    results.append(replace(item,value=None))
+                    continue
+                if self._future:
+                    annotated = (_ProofOutcome(item.state,_ProofValue(frozenset({("plain-string",self.index.node_id(node.annotation))}))),)
+                else:
+                    annotated = expression(node.annotation,item.state)
+                for outcome in annotated:
+                    visits = visit_then(item.visits,outcome.visits)
+                    state = outcome.state
+                    if outcome.normal and isinstance(node.target,ast.Name) and node.simple:
+                        mapping,error = annotation_mapping(state)
+                        if error is not None:
+                            state = self._implicit_error(node,error,state,stats,
+                                fields=(("name",_ProofValue.literal("__annotations__")),))
+                        else:
+                            atom = _ProofEffects.single(mapping)
+                            if not atom or atom[:2]!=("namespace","mapping"):
+                                raise _ProofIncomplete("unsupported-annotation-mapping")
+                            reserve_graph(state,(mapping,outcome.value),passes=2)
+                            mark_interference()
+                            state = _ProofEffects.store(self.index,scope,mapping,
+                                self.index.runtime_name(scope,node.target.id),outcome.value,state)
+                    results.append(_ProofOutcome(state,visits=visits))
+            return bounded(results,node)
+
         def subscript_nodes(node):
             if isinstance(node.slice, ast.Slice):
                 return (node.value,) + tuple(part for part in (node.slice.lower, node.slice.upper, node.slice.step)
@@ -8686,7 +8937,8 @@ class _ProofContext:
                 error = "NameError" if value.is_unbound else None
             else:
                 selected = current.region_value(("function", token[1]), "$builtins")
-                value, error = _ProofEffects.lookup(self.index, declaration, current, name, selected_builtins=selected)
+                value, error = _ProofEffects.lookup(self.index, declaration, current, name, selected_builtins=selected,
+                    live_owners=(self.index.node_id(root_scope),))
             if error:
                 current = self._implicit_error(declaration.body, error, current, stats,
                     fields=(("name", _ProofValue.literal(self.index.runtime_name(declaration, name))),))
@@ -8732,12 +8984,13 @@ class _ProofContext:
             return bounded(results, node)
 
         def class_definition(node, incoming):
-            if node.type_params or not all(isinstance(part, ast.Pass) for part in node.body):
+            if node.type_params:
                 raise _ProofIncomplete("unsupported-class-body")
             decorators, abrupt = operands(tuple(node.decorator_list), incoming)
             results = list(abrupt)
+            requests = []
             for captured, current, visits in decorators:
-                if _ProofEffects.frame_builtin(current, "__build_class__") != _ProofValue(frozenset({("native","__build_class__")})):
+                if frame_builtin(current, "__build_class__") != _ProofValue(frozenset({("native","__build_class__")})):
                     raise _ProofIncomplete("class-builder-identity")
                 decorator_holds = current.temporaries
                 body_function, current = make_function(node, (), current)
@@ -8761,6 +9014,13 @@ class _ProofContext:
                     combined = visit_then(visits, header_visits)
                     record(node, "build", current)
                     combined = visit_then(combined, visit_event(node,"build"))
+                    if not all(isinstance(part,ast.Pass) for part in node.body):
+                        base_value = _ProofValue(frozenset({base}))
+                        current = replace(current,temporaries=current.temporaries+(base_value,))
+                        requests.append((_ProofOutcome(current,visits=combined),_ProofClassFrame(
+                            owner,captured,base_value,len(incoming.temporaries),len(decorator_holds),
+                            current.active,len(current.managers),len(current.continuation))))
+                        continue
                     self._charge(stats, 2 * len(current.regions) + 1)
                     module = _ProofEffects.region_value(self.index, scope, current, ("globals",0), "__name__")
                     if module == _ProofValue.absent():
@@ -8790,7 +9050,7 @@ class _ProofContext:
                     current = prune_graph(replace(current,temporaries=decorator_holds+(value,)))
                     current = replace(current,temporaries=decorator_holds)
                     results.append(apply_definition(node,captured,value,current,combined,incoming))
-            return bounded(results,node)
+            return bounded(results,node),tuple(requests)
 
         def expression(node, state):
             origin = region_origin(node, state)
@@ -8825,7 +9085,10 @@ class _ProofContext:
                 else:
                     raise _ProofIncomplete("unsupported-lambda")
             elif isinstance(node, ast.Name):
-                result, error = _ProofEffects.lookup(self.index, scope, state, node.id)
+                selected = state.region_value(("function",owner),"$builtins") if current_frame is not None else None
+                result, error = _ProofEffects.lookup(self.index, scope, state, node.id,
+                    selected_builtins=selected,native_class=current_frame is not None,
+                    live_owners=(self.index.node_id(root_scope),) if current_frame is not None else ())
                 if not error and (result.unknown or ("unbound",) in result.atoms or not result.atoms):
                     raise _ProofIncomplete("imprecise-load")
             elif isinstance(node, ast.NamedExpr):
@@ -9018,12 +9281,17 @@ class _ProofContext:
                         return self.index.node_id(outer)
                     outer = self.index.enclosing_scope(outer)
                 raise _ProofIncomplete("unresolved-store")
-            if isinstance(scope, ast.ClassDef) and self.index.namespace_open(scope):
+            if isinstance(scope, ast.ClassDef) and self.index.namespace_open(scope) and current_frame is None:
                 raise _ProofIncomplete("open-class-store")
             return owner
 
         def bind_name(name, value, state, delete=False):
             target_owner = storage(name)
+            if current_frame is not None and target_owner==owner:
+                names = {spelling for storage,spelling,held in state.bindings if storage==owner} \
+                    |self.index.locals_for(scope)|self.index.globals_for(scope)|self.index.nonlocals_for(scope)|{name}
+                if len(names)>self.limits["names"]:
+                    raise _ProofIncomplete("name-budget")
             if target_owner == 0 and self.index.runtime_name(scope, name) != name:
                 raise _ProofIncomplete("mangled-runtime-namespace")
             if target_owner != owner or not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) \
@@ -9144,6 +9412,19 @@ class _ProofContext:
             routes = {}
             queued = set()
 
+            def cursor_origins(cursor):
+                return tuple(frame[2] if frame[1] in ("after","scope-exit") else frame[2].body_origin
+                    for frame in cursor if frame[1] in ("after","scope-exit")
+                    or frame[1]=="class-return" and frame[2].body_origin>=0)
+
+            def activate(cursor):
+                nonlocal scope,owner,current_frame,body
+                frame = next((frame for frame in reversed(cursor) if frame[1]=="class-return"),None)
+                scope = self.index.node_for_id(frame[0]) if frame is not None else root_scope
+                owner = self.index.node_id(scope)
+                current_frame = frame[2] if frame is not None else None
+                body = scope.body
+
             def enqueue(cursor, state, observation=None, visits=_ProofVisits()):
                 state = prune_graph(state)
                 # Each after-marker is one live compound continuation; its
@@ -9154,15 +9435,17 @@ class _ProofContext:
                                  for frame in cursor if frame[1] == "handler-resume")
                 restoring.update(frame[0] for frame in cursor if frame[1] in ("star-next", "star-body-resume"))
                 restoring.update(frame[0] for frame in cursor if frame[1] == "with-exit")
+                restoring.update(frame[0] for frame in cursor if frame[1] == "class-return")
                 depth = state.context_depth() \
-                    + sum(frame[1] == "after" and frame[0] not in restoring for frame in cursor)
+                    + sum(frame[1] == "after" and frame[0] not in restoring for frame in cursor) \
+                    + sum(frame[1] == "class-return" for frame in cursor)
                 if depth > self.limits["contexts"]:
                     raise _ProofIncomplete("context-budget")
                 stats["context_depth"] = max(stats["context_depth"], depth)
                 action = "observe" if observation is not None else (
                     "dispatch" if state.pending.kind != "normal" else "step")
                 visit_charge(1 + len(active_traces) + len(cursor))
-                origins = tuple(frame[2] for frame in cursor if frame[1] in ("after", "scope-exit"))
+                origins = cursor_origins(cursor)
                 key = (action, cursor, _ProofOutcome(state, observation=observation))
                 if key not in routes:
                     slots = 1 + len(origins)
@@ -9194,13 +9477,13 @@ class _ProofContext:
                 # Coroutine escape converts StopIteration after all in-frame
                 # handlers/finally. Interior handlers must still see the
                 # original exception. Generator resumption is not modeled.
-                if isinstance(scope, ast.AsyncFunctionDef) and state.pending.kind == "raise" \
+                if isinstance(root_scope, ast.AsyncFunctionDef) and state.pending.kind == "raise" \
                         and state.pending.error_kind == "StopIteration":
                     original = state.pending.error
                     if state.exception_object(original) is None:
                         raise _ProofIncomplete("unowned-coroutine-stop")
                     active = state.active
-                    state = self._implicit_error(scope, "RuntimeError", replace(state,
+                    state = self._implicit_error(root_scope, "RuntimeError", replace(state,
                         active=active + (("error", original),)), stats)
                     reserve_graph(state, passes=4)
                     state = _ProofEffects.explicitly_raised(state, state.pending.error, original, True)
@@ -9209,14 +9492,119 @@ class _ProofContext:
                 exits.append(state)
                 root = next(frame for frame in cursor if frame[1] == "scope-exit")
                 if state.pending.kind != "diverge":
-                    trace_add(visit_event(scope, "exit"))
-                    record(scope, "exit", state)
+                    trace_add(visit_event(root_scope, "exit"))
+                    record(root_scope, "exit", state)
                 record_region(root[2], trace_result(root[2], _ProofOutcome(state)))
 
             def observe_regions(cursor, outcome):
-                for site, field, incoming in cursor:
-                    if field in ("after", "scope-exit"):
-                        record_region(incoming, trace_result(incoming, outcome))
+                for incoming in cursor_origins(cursor):
+                    record_region(incoming, trace_result(incoming, outcome))
+
+            def class_enter(cursor,state):
+                nonlocal active_traces
+                site = cursor[-1][0]
+                frame = cursor[-2][2]
+                origin = region_origin(("class-body",site),state)
+                frame = replace(frame,body_origin=origin)
+                cursor = cursor[:-2]+((site,"class-return",frame),)
+                # The child's own trace starts here; caller traces retain the
+                # header prefix already consumed by __build_class__.
+                active_traces += ((origin,_ProofVisits()),)
+                record(scope,"entry",state)
+                trace_add(visit_event(scope,"entry"))
+                if any(storage==site for storage,name,value in state.bindings):
+                    raise _ProofIncomplete("repeated-class-frame")
+                if len(self.index.locals_for(scope)|self.index.globals_for(scope)|self.index.nonlocals_for(scope)
+                       |{name for name,value in self._class_entry_defaults[scope]})>self.limits["names"]:
+                    raise _ProofIncomplete("name-budget")
+                selected = state.region_value(("function",site),"$builtins")
+                module = _ProofEffects.region_value(self.index,scope,state,("globals",0),"__name__")
+                if module==_ProofValue.absent():
+                    module = _ProofEffects.captured_builtin(self.index,scope,state,selected,"__name__")
+                if module==_ProofValue.absent():
+                    state = self._implicit_error(scope,"NameError",state,stats,
+                        fields=(("name",_ProofValue.literal("__name__")),))
+                    enqueue(cursor,state)
+                    return
+                _ProofEffects.read_value(module)
+                for name,value in self._class_entry_defaults[scope]:
+                    state = bind_name(name,module if name=="__module__" else value,state)
+                state = annotation_setup(state)
+                self._check_alias_budget(state,stats)
+                enqueue(cursor+((site,"body",0),),state)
+
+            def class_leave(cursor,state):
+                site,unused,frame = cursor[-1]
+                node = self.index.node_for_id(site)
+                if len(state.managers)!=frame.managers or len(state.continuation)!=frame.continuation:
+                    raise _ProofIncomplete("class-frame-unwind")
+                if state.pending.kind not in ("normal","raise"):
+                    raise _ProofIncomplete("cross-class-transfer")
+                if state.pending.kind=="normal" and self.semantic_key[1][:2]>=(3,14) \
+                        and not self._future \
+                        and any(isinstance(item.target,ast.Name) and item.simple for item in self._class_annotations[scope]):
+                    raise _ProofIncomplete("unsupported-class-annotation-function")
+                if state.pending.kind=="normal" and self.semantic_key[1][:2]>=(3,13):
+                    names = self.index._static_attributes[scope]
+                    self._charge(stats,1+len(names))
+                    if len(names)+1>self.limits["aliases"]:
+                        raise _ProofIncomplete("alias-budget")
+                    items = tuple(_ProofValue.literal(name) for name in names)
+                    reserve_graph(state,items)
+                    attributes,state = _ProofEffects.allocate_collection(state,"tuple",owner,items,"static-attributes")
+                    state = bind_name("__static_attributes__",attributes,state)
+                    self._check_alias_budget(state,stats)
+                record(node,"exit",state)
+                trace_add(visit_event(node,"exit"))
+                record_region(frame.body_origin,trace_result(frame.body_origin,_ProofOutcome(state)))
+                rows = {name:value for storage,name,value in state.bindings if storage==site and not value.is_unbound}
+                value = None
+                if state.pending.kind=="normal":
+                    qualname = rows.get("__qualname__",_ProofValue(frozenset({("plain-string",site)})))
+                    atom = _ProofEffects.single(qualname)
+                    if not _ProofEffects.class_qualname(qualname):
+                        if atom and _ProofEffects.closed_leaf(atom):
+                            state = self._implicit_error(node,"TypeError",state,stats)
+                        else:
+                            raise _ProofIncomplete("opaque-class-qualname")
+                    if any(key in rows for key in ("__slots__","__classcell__","__classdictcell__")):
+                        raise _ProofIncomplete("unsupported-class-construction-field")
+                    if state.pending.kind=="normal":
+                        region = ("class",site)
+                        if region in _ProofEffects.reachable(state)[4] or any(old==region for old,name,held in state.regions):
+                            raise _ProofIncomplete("repeated-class-allocation")
+                        module = rows.get("__module__",_ProofEffects.region_value(
+                            self.index,scope,state,("globals",0),"__name__"))
+                        if any(not _ProofEffects.class_field_value(held,state) for held in (*rows.values(),module)):
+                            raise _ProofIncomplete("opaque-class-set-name")
+                        self._charge(stats,4+len(rows))
+                        state = state.write_region(region,"$owned",_ProofValue.literal(True))
+                        state = state.write_region(region,"$body",_ProofValue.literal(True))
+                        state = state.write_region(region,"$base",frame.base)
+                        state = state.write_region(region,"$module",module)
+                        for name,held in rows.items():
+                            if name!="__module__":
+                                state = state.write_region(region,"field:"+self.index.runtime_name(scope,name),held)
+                        if "__qualname__" not in rows:
+                            state = state.write_region(region,"field:__qualname__",qualname)
+                        value = _ProofValue(frozenset({region}))
+                        state = replace(state,temporaries=state.temporaries+(value,))
+                before = state
+                state = replace(state,bindings=tuple(row for row in state.bindings if row[0]!=site),active=frame.active)
+                reserve_graph(before,tuple(rows.values()),passes=2)
+                _ProofEffects.check_dropped(before,state,tuple(rows.values()))
+                prefix = state.temporaries[:frame.holds]
+                if value is None:
+                    state = drop_holds(state,prefix)
+                    activate(cursor[:-1])
+                    enqueue(cursor[:-1],state)
+                else:
+                    state = drop_holds(state,state.temporaries[:frame.decorator_holds],(value,))
+                    state = prune_graph(replace(state,temporaries=state.temporaries+(value,)))
+                    activate(cursor[:-1])
+                    incoming = replace(state,temporaries=prefix)
+                    outcome = apply_definition(node,frame.decorators,value,state,_ProofVisits(),incoming)
+                    route(cursor[:-1],outcome)
 
             def begin_finally(cursor, state):
                 site = cursor[-1][0]
@@ -9477,15 +9865,18 @@ class _ProofContext:
                 enqueue(cursor[:-1], current)
 
             for state in dict.fromkeys(entry):
-                enqueue(((owner, "scope-exit", region_origin(scope, state)), (owner, "body", 0)), state,
+                origin = region_origin(scope,state)
+                state = annotation_setup(state)
+                enqueue(((owner, "scope-exit", origin), (owner, "body", 0)), state,
                         visits=visit_event(scope, "entry"))
             while queue:
                 key = queue.popleft()
                 queued.remove(key)
                 action, cursor, outcome = key
+                activate(cursor)
                 active_traces = routes[key]
                 state = outcome.state
-                active_origins = tuple(frame[2] for frame in cursor if frame[1] in ("after", "scope-exit"))
+                active_origins = cursor_origins(cursor)
                 phases = []
                 for offset, (site, tag, data) in enumerate(cursor):
                     if tag != "suite-exit" or offset + 1 == len(cursor):
@@ -9541,6 +9932,8 @@ class _ProofContext:
                             finish_search(cursor[:offset + 1], state, state.pending)
                         elif field == "handler-resume":
                             resume_handler(cursor[:offset + 1], state)
+                        elif field == "class-return":
+                            class_leave(cursor[:offset+1],state)
                         elif field == "for-next" and state.pending.kind in ("break", "continue") \
                                 and state.pending.target == site:
                             destination = cursor[:offset] if state.pending.kind == "break" else cursor[:offset + 1]
@@ -9562,6 +9955,14 @@ class _ProofContext:
                     continue
                 container_id, field, position = cursor[-1]
                 container = self.index.node_for_id(container_id)
+                if field == "class-entry":
+                    self._charge(stats)
+                    class_enter(cursor,state)
+                    continue
+                if field == "class-return":
+                    self._charge(stats)
+                    class_leave(cursor,state)
+                    continue
                 if field == "scope-exit":
                     terminal(state)
                     continue
@@ -9812,8 +10213,9 @@ class _ProofContext:
                             route(successor, statement_result(origin, outcome))
                     continue
                 elif isinstance(node, (ast.Break, ast.Continue)):
+                    boundary = max((offset for offset,frame in enumerate(cursor) if frame[1]=="class-return"),default=-1)
                     destination = next((offset for offset in range(len(cursor) - 1, -1, -1)
-                                        if cursor[offset][1] == "for-next"), None)
+                                        if offset>boundary and cursor[offset][1] == "for-next"), None)
                     if destination is None:
                         raise _ProofIncomplete("transfer-outside-modeled-loop")
                     state = replace(state, pending=_ProofCompletion(
@@ -9888,7 +10290,7 @@ class _ProofContext:
                         visits=visit_event(node, "transfer"))))
                     continue
                 elif isinstance(node, ast.Import):
-                    if _ProofEffects.frame_builtin(state, "__import__") != _ProofValue(
+                    if frame_builtin(state, "__import__") != _ProofValue(
                             frozenset({("native", "__import__")})):
                         raise _ProofIncomplete("opaque-import")
                     mark_interference()
@@ -9899,7 +10301,7 @@ class _ProofContext:
                                           _ProofEffects.namespace("module", (alias.name, 0)), state)
                 elif isinstance(node, ast.ImportFrom):
                     if node.level or node.module != "contextlib" or any(alias.name != "suppress" for alias in node.names) \
-                            or _ProofEffects.frame_builtin(state, "__import__") != _ProofValue(frozenset({("native", "__import__")})):
+                            or frame_builtin(state, "__import__") != _ProofValue(frozenset({("native", "__import__")})):
                         raise _ProofIncomplete("unsupported-import")
                     mark_interference()
                     for alias in node.names:
@@ -9926,7 +10328,8 @@ class _ProofContext:
                     statement_outcomes = definition(node, state)
                 elif isinstance(node, ast.ClassDef):
                     mark_interference()
-                    if not node.bases and not node.keywords and not node.decorator_list:
+                    if current_frame is None and not node.bases and not node.keywords and not node.decorator_list \
+                            and all(isinstance(part,ast.Pass) for part in node.body):
                         # Preserve the existing empty-instance contract until
                         # owned instances retain their new nominal class graph.
                         self._charge(stats,2)
@@ -9935,7 +10338,12 @@ class _ProofContext:
                         state = bind_name(node.name, value, state)
                         statement_outcomes = (_ProofOutcome(state,visits=visit_event(node,"build")),)
                     else:
-                        statement_outcomes = class_definition(node,state)
+                        statement_outcomes,requests = class_definition(node,state)
+                        for requested,frame in requests:
+                            eager_frames.add(self.index.node_id(node))
+                            route(successor+((self.index.node_id(node),"after",origin),
+                                (self.index.node_id(node),"class-return",frame),
+                                (self.index.node_id(node),"class-entry",0)),requested)
                 elif isinstance(node, (ast.Assign, ast.Expr)):
                     statement_outcomes = expression(node.value, state)
                     if isinstance(node, ast.Assign):
@@ -9948,6 +10356,8 @@ class _ProofContext:
                         self._charge(stats)
                         statement_outcomes = flat_map(statement_outcomes, lambda outcome: (
                             _ProofOutcome(bind_name("__doc__", outcome.value, outcome.state), outcome.value),))
+                elif isinstance(node,ast.AnnAssign):
+                    statement_outcomes = annotation_statement(node,state)
                 else:
                     raise _ProofIncomplete("unsupported-statement")
                 for outcome in statement_outcomes if statement_outcomes is not None else (_ProofOutcome(state),):
@@ -28171,6 +28581,375 @@ class ProofFlowTests(unittest.TestCase):
     def _class_header_solve(self, body, **kwargs):
         seed = _ProofState().bind(0,"__name__",_ProofValue.literal("fixture"))
         return self._solve(body,entry=(seed,),**kwargs)
+
+    def _eager_class_parameters(self,body,parameters):
+        context = _ProofContext("def f("+parameters+"):\n"+"".join("    "+line+"\n" for line in body.splitlines()))
+        func = context.tree.body[0]
+        owner = context.index.node_id(func)
+        seed = _ProofState().bind(0,"__name__",_ProofValue.literal("fixture"))
+        for name in parameters.split(","):
+            seed = seed.bind(owner,name,_ProofValue(frozenset({("opaque","parameter",owner,name)})))
+        return context,func,context.solve(func,entry=(seed,))
+    def test_eager_class_visits_keep_equal_bit_positions_distinct_by_owner(self):
+        root = _ProofVisits(1,1)
+        child = _ProofVisits(owned=((7,1,1),))
+        result = root.then(child)
+        self.assertEqual((result.may,result.must),(1,1))
+        self.assertEqual(result.owned,((7,1,1),))
+        self.assertEqual(child.then(_ProofVisits(owned=((8,1,1),))).owned,((7,1,1),(8,1,1)))
+
+    def test_eager_class_visits_join_missing_owner_contributes_empty_must(self):
+        left = _ProofVisits(1,1,((7,3,3),))
+        right = _ProofVisits(1,1,((8,4,4),))
+        result = left.join(right)
+        self.assertEqual((result.may,result.must),(1,1))
+        self.assertEqual(result.owned,((7,3,0),(8,4,0)))
+        self.assertEqual(left.join(_ProofVisits(1,1,((7,6,6),))).owned,((7,7,2),))
+        self.assertEqual(result.then(left).owned,((7,3,3),(8,4,0)))
+
+    def test_eager_class_visits_validate_canonical_owner_rows(self):
+        for rows in ([(1,1,1)],((True,1,1),),((1,True,1),),((1,1,2),),
+                     ((1,0,0),),((2,1,1),(1,1,1)),((1,1,1),(1,2,2))):
+            with self.subTest(rows=rows):
+                with self.assertRaises(TypeError):
+                    _ProofVisits(owned=rows)
+
+    def test_eager_class_p10_global_body_write_reaches_the_parent(self):
+        context,func,result = self._class_header_solve("class Initialize:\n    global present\n"
+            "    present=0\nvalue=present\nmarker=int")
+        cls = func.body[0]
+        self.assertTrue(result.complete,result.reasons)
+        self.assertTrue(result.must_execute(func.body[-1]))
+        self.assertTrue(result.must_execute(cls.body[1]))
+        self.assertEqual(result.exits[0].region_value(("globals",0),"present"),_ProofValue.literal(0))
+
+    def test_eager_class_body_failure_preserves_writes_and_skips_final_bind(self):
+        context,func,result = self._class_header_solve("C=int\ntry:\n    @lambda c:TypeError\n    class C:\n"
+            "        global present\n        present=1\n        1/0\n        later=1\n"
+            "except ZeroDivisionError:\n    pass\nmarker=C")
+        cls = func.body[1].body[0]
+        self.assertTrue(result.complete,result.reasons)
+        self.assertEqual(result.exits[0].lookup(context.index.node_id(func),"marker"),
+                         _ProofValue(frozenset({("native","int")})))
+        self.assertEqual(result.exits[0].region_value(("globals",0),"present"),_ProofValue.literal(1))
+        self.assertTrue(result.target_unreachable(cls.body[-1]))
+        self.assertTrue(result.target_unreachable((cls.decorator_list[0],"apply")))
+
+    def test_eager_class_namespace_becomes_owned_fields_without_local_roots(self):
+        context,func,result = self._class_header_solve("class C:\n    value=1\nmarker=C.value")
+        cls = func.body[0]
+        self.assertTrue(result.complete,result.reasons)
+        self.assertEqual(result.exits[0].lookup(context.index.node_id(func),"marker"),_ProofValue.literal(1))
+        self.assertFalse(any(owner==context.index.node_id(cls) for owner,name,value in result.exits[0].bindings))
+        other = context.tree
+        reused = context.solve(other,entry=result.exits)
+        self.assertTrue(reused.complete,reused.reasons)
+
+    def test_eager_class_metatype_descriptors_override_namespace_values(self):
+        for name,expected in (("__name__",_ProofValue.literal("C")),
+                              ("__class__",_ProofValue(frozenset({("native","type")})))):
+            context,func,result = self._class_header_solve("class C:\n    "+name+"=1\nmarker=C."+name)
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual(result.exits[0].lookup(context.index.node_id(func),"marker"),expected)
+        context,func,result = self._class_header_solve("class C:\n    __dict__=1\nmarker=C.__dict__")
+        self.assertFalse(result.complete)
+
+    def test_eager_class_lookups_publish_the_actual_closed_frame(self):
+        context,func,result = self._class_header_solve("class C(object):\n    value=int\nmarker=1")
+        cls = func.body[0]
+        load = cls.body[0].value
+        self.assertTrue(result.complete,result.reasons)
+        self.assertTrue(result.native_identity(load,"int"))
+        self.assertEqual(result.load_kind(load),"bound")
+
+    def test_eager_class_nested_frames_do_not_capture_the_outer_class_dict(self):
+        context,func,result = self._class_header_solve("x=1\nclass C:\n    x=2\n    own=x\n"
+            "    class D:\n        value=x\nmarker=C.D.value\nouter=C.own")
+        self.assertTrue(result.complete,result.reasons)
+        state = result.exits[0]
+        owner = context.index.node_id(func)
+        self.assertEqual(state.lookup(owner,"marker"),_ProofValue.literal(1))
+        self.assertEqual(state.lookup(owner,"outer"),_ProofValue.literal(2))
+        self.assertEqual(result.stats["context_depth"],2)
+
+    def test_eager_class_inherits_active_exception_and_unwinds_its_own_finally(self):
+        context,func,result = self._class_header_solve("try:\n    raise ValueError()\nexcept ValueError as original:\n"
+            "    try:\n        class C:\n            try:\n                raise\n"
+            "            finally:\n                global done\n                done=1\n"
+            "    except ValueError as caught:\n        same=caught is original\n    marker=same")
+        self.assertTrue(result.complete,result.reasons)
+        self.assertEqual(result.exits[0].lookup(context.index.node_id(func),"marker"),_ProofValue.literal(True))
+        self.assertEqual(result.exits[0].region_value(("globals",0),"done"),_ProofValue.literal(1))
+
+    def test_eager_class_never_dispatches_a_loop_transfer_to_its_caller(self):
+        for transfer in ("break","continue"):
+            context,func,result = self._class_header_solve("for item in iter(int,1):\n    class C:\n        "+transfer+"\nmarker=1")
+            self.assertFalse(result.complete)
+            self.assertFalse(result.target_unreachable(func.body[-1]))
+
+    def test_eager_class_event_domain_excludes_deferred_methods(self):
+        context,func,result = self._class_header_solve("class C:\n    value=1\n    def method():\n        return missing\nmarker=1")
+        cls = func.body[0]
+        method = cls.body[1]
+        self.assertTrue(result.complete,result.reasons)
+        self.assertTrue(result.must_execute(cls.body[0]))
+        deferred = result.target_unreachable(method.body[0])
+        self.assertFalse(deferred.complete)
+        self.assertIn("foreign-event-owner",deferred.reasons)
+        self.assertFalse(result.states_at(method.body[0]))
+
+    def test_eager_class_captured_builtins_and_later_module_lookup_have_distinct_horizons(self):
+        context,func,result = self._class_header_solve("global __builtins__,__name__\n"
+            "class C(((__builtins__:={}),(__name__:='changed'),object)[2]):\n"
+            "    selected=int\n    module=__module__\nmarker=C.selected\nmodule=C.module")
+        self.assertTrue(result.complete,result.reasons)
+        owner = context.index.node_id(func)
+        self.assertEqual(result.exits[0].lookup(owner,"marker"),_ProofValue(frozenset({("native","int")})))
+        self.assertEqual(result.exits[0].lookup(owner,"module"),_ProofValue.literal("changed"))
+
+    def test_eager_class_failed_namespace_releases_are_checked(self):
+        for keep in (False,True):
+            prefix = "keep=x\n" if keep else ""
+            context,func,result = self._eager_class_parameters(prefix+"try:\n    class C:\n        nonlocal x\n"
+                "        held=x\n        del x\n        1/0\nexcept ZeroDivisionError:\n    pass\nmarker=1",parameters="x")
+            self.assertEqual(result.complete,keep,result.reasons)
+            if not keep:
+                self.assertIn("opaque-release",result.reasons)
+
+    def test_eager_class_fields_keep_owned_container_edges_after_the_source_binding_dies(self):
+        context,func,result = self._eager_class_parameters("class C:\n    held=[x]\nx=0\nreturn C",parameters="x")
+        self.assertTrue(result.complete,result.reasons)
+        self.assertEqual(result.exits[0].pending.kind,"return")
+
+    def test_eager_class_invalid_qualname_fails_after_body_effects(self):
+        context,func,result = self._class_header_solve("C=int\ntry:\n    class C:\n        global done\n"
+            "        done=1\n        __qualname__=1\nexcept TypeError:\n    pass\nmarker=C")
+        self.assertTrue(result.complete,result.reasons)
+        self.assertEqual(result.exits[0].region_value(("globals",0),"done"),_ProofValue.literal(1))
+        self.assertEqual(result.exits[0].lookup(context.index.node_id(func),"marker"),
+                         _ProofValue(frozenset({("native","int")})))
+
+    def test_eager_class_opaque_attribute_does_not_skip_set_name_protocol(self):
+        context,func,result = self._eager_class_parameters("class C:\n    value=x\nmarker=1",parameters="x")
+        self.assertFalse(result.complete)
+        self.assertIn("opaque-class-set-name",result.reasons)
+        self.assertFalse(result.must_execute(func.body[-1]))
+
+    def test_eager_class_whole_definition_query_does_not_alias_body_entry(self):
+        context,func,result = self._class_header_solve("prefix=1\nclass C:\n    value=1\nmarker=1")
+        cls = func.body[1]
+        self.assertTrue(result.complete,result.reasons)
+        before = result.states_at(cls)[0]
+        outcomes = result.outcomes(cls,before)
+        self.assertTrue(outcomes.complete,outcomes.reasons)
+        self.assertTrue(all(item.state.lookup(context.index.node_id(func),"C").atoms for item in outcomes.alternatives))
+        child_before = result.states_at(cls.body[0])[0]
+        self.assertTrue(result.must_execute(cls.body[0],incoming=before,region=cls))
+        self.assertFalse(result.must_execute(func.body[0],incoming=child_before,region=cls.body[0]))
+
+    def test_eager_class_shares_the_parent_context_and_work_caps(self):
+        body = "class C:\n    global present\n    present=1\nmarker=1"
+        context,func,result = self._class_header_solve(body)
+        self.assertTrue(result.complete,result.reasons)
+        cost = result.stats["steps"]
+        for cap,want in ((cost-1,False),(cost,True),(cost+1,True)):
+            candidate,scope,outcome = self._class_header_solve(body,limits={"steps":cap})
+            self.assertEqual(outcome.complete,want,outcome.reasons)
+            before = dict(candidate.total_compute)
+            seed = _ProofState().bind(0,"__name__",_ProofValue.literal("fixture"))
+            self.assertIs(candidate.solve(scope,entry=(seed,)),outcome)
+            self.assertEqual(dict(candidate.total_compute),before)
+        context,func,result = self._class_header_solve(body,limits={"contexts":0})
+        self.assertFalse(result.complete)
+        self.assertIn("context-budget",result.reasons)
+
+    def _eager_annotation_solve(self,body,version,future=False,extra_globals=()):
+        prefix = "from __future__ import annotations\n" if future else ""
+        context = _ProofContext(prefix+"def f():\n"+"".join("    "+line+"\n" for line in body.splitlines()),semantic_key=version)
+        func = context.tree.body[-1]
+        state = _ProofState().bind(0,"__name__",_ProofValue.literal("fixture"))
+        state = state.bind(0,"__builtins__",_ProofEffects.namespace("module",("builtins",0)))
+        for name,value in extra_globals:
+            state = state.bind(0,name,value)
+        for name in ("__build_class__","int","object","NameError","TypeError","ZeroDivisionError"):
+            state = state.write_region(("builtins",0),name,_ProofValue(frozenset({("native",name)})))
+        return context,func,context.solve(func,entry=(state,))
+
+    def test_eager_class_annotation_map_initialization_uses_the_compiler_profile(self):
+        for annotation in ("x:int", "if False:\n    missing[0]:int", "mapping[0]:int"):
+            for version in ((3,12),(3,14)):
+                with self.subTest(annotation=annotation,version=version):
+                    body = "mapping={}\ntry:\n    class C:\n"+"".join("        "+line+"\n" for line in
+                        (annotation+"\ndel __annotations__").splitlines())+"except NameError:\n    marker=2\nelse:\n    marker=1"
+                    context,func,result = self._eager_annotation_solve(body,version)
+                    self.assertTrue(result.complete,result.reasons)
+                    self.assertEqual(result.exits[0].lookup(context.index.node_id(func),"marker"),
+                                     _ProofValue.literal(1 if version==(3,12) else 2))
+
+    def test_eager_class_annotation_only_name_blocks_outer_cell_without_binding(self):
+        for version in ((3,12),(3,14)):
+            context,func,result = self._eager_annotation_solve("x=1\ntry:\n    class C:\n        x:int\n"
+                "        value=x\nexcept NameError:\n    marker=2\nelse:\n    marker=1",version)
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual(result.exits[0].lookup(context.index.node_id(func),"marker"),_ProofValue.literal(2))
+
+    def test_eager_class_annotation_error_then_delete_retains_version_order(self):
+        for version in ((3,12),(3,14)):
+            context,func,result = self._eager_annotation_solve("try:\n    class C:\n        try:\n"
+                "            value:1/0\n        except ZeroDivisionError:\n            pass\n        del __annotations__\n"
+                "except NameError:\n    marker=2\nelse:\n    marker=1",version)
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual(result.exits[0].lookup(context.index.node_id(func),"marker"),
+                             _ProofValue.literal(1 if version==(3,12) else 2))
+
+    def test_eager_class_annotation_walrus_rejection_does_not_become_a_body_error_proof(self):
+        context,func,result = self._eager_annotation_solve("try:\n    class C:\n        value:(other:=int)\n"
+            "        del __annotations__\nexcept NameError:\n    marker=1",(3,14))
+        self.assertFalse(result.complete)
+        self.assertFalse(result.must_execute(func.body[-1].handlers[0].body[0]))
+
+    def test_eager_class_method_local_annotation_cells_follow_the_compiler_profile(self):
+        for version in ((3,12),(3,14)):
+            context = _ProofContext("def f(x):\n    class C:\n        def method():\n            value:x\n",semantic_key=version)
+            func = context.tree.body[0]
+            method = func.body[0].body[0]
+            cells = context.index._function_cells[method]
+            self.assertEqual((context.index.node_id(func),"x") in cells,version==(3,12))
+
+    def test_eager_class_annotation_setup_counts_its_implicit_local_slot(self):
+        body = "try:\n    class C:\n        value:int\n        raise ValueError()\nexcept ValueError:\n    marker=1"
+        for cap,want in ((3,False),(4,True),(5,True)):
+            context,func,result = self._class_header_solve(body,semantic_key=(3,12),limits={"names":cap})
+            self.assertEqual(result.complete,want,result.reasons)
+            if not want:
+                self.assertIn("name-budget",result.reasons)
+
+    def test_eager_class_reborrowed_qualname_preserves_native_construction_invariants(self):
+        context = _ProofContext("def make():\n    class C:\n        value=1\n    return C\n"
+            "def read(provided):\n    marker=provided.__qualname__\n")
+        make,read = context.tree.body
+        seed = _ProofState().bind(0,"__name__",_ProofValue.literal("fixture"))
+        built = context.solve(make,entry=(seed,))
+        self.assertTrue(built.complete,built.reasons)
+        state = built.exits[0]
+        value = state.pending.value
+        state = replace(state,pending=_ProofCompletion()).bind(context.index.node_id(read),"provided",value)
+        good = context.solve(read,entry=(state,))
+        self.assertTrue(good.complete,good.reasons)
+        bad = state.write_region(_ProofEffects.single(value),"field:__qualname__",_ProofValue.literal(1))
+        result = context.solve(read,entry=(bad,))
+        self.assertFalse(result.complete)
+
+    def test_eager_class_module_fallback_cannot_omit_a_set_name_hook(self):
+        context,func,result = self._eager_class_parameters("class C:\n    global __module__,__name__\n"
+            "    __name__=x\nmarker=1",parameters="x")
+        self.assertFalse(result.complete)
+        self.assertIn("opaque-class-set-name",result.reasons)
+
+    def test_eager_class_deleted_namespace_keys_do_not_become_type_fields(self):
+        context,func,result = self._class_header_solve("class C:\n    del __qualname__\nmarker=C.__qualname__")
+        self.assertTrue(result.complete,result.reasons)
+        self.assertTrue(_ProofEffects.class_qualname(result.exits[0].lookup(context.index.node_id(func),"marker")))
+        context,func,result = self._class_header_solve("class C:\n    value=1\n    del value\nmarker=C.value")
+        self.assertFalse(result.complete)
+
+    def test_eager_class_static_attributes_match_codegen_not_generic_store_syntax(self):
+        cases = (("def m(self):\n    self.x=1",("x",)),("def m(other):\n    self.x=1",("x",)),
+            ("def m(this):\n    this.x=1",()),("def m(self):\n    self.x+=1",()),
+            ("def m(self):\n    self.x:int",()),("def m(self):\n    self.x:int=1",("x",)),
+            ("def m(self):\n    if False:\n        self.x=1",("x",)),
+            ("def m(self):\n    class D:\n        self.x=1",("x",)),
+            ("class D:\n    def m(self):\n        self.y=1",()),
+            ("def m(self):\n    [1 for self.x in()]",("x",)),
+            ("def m(self):\n    gen=(1 for self.x in())",("x",)),
+            ("[1 for self.x in()]",()),("gen=(1 for self.x in())",("x",)),
+            ("def m(self):\n    self.__x=1",("__x",)),
+            ("def m(self):\n    self.z=1\n    self.a=1\n    self.z=2",("a","z")))
+        for body,expected in cases:
+            with self.subTest(body=body):
+                context = _ProofContext("class C:\n"+"".join("    "+line+"\n" for line in body.splitlines()),semantic_key=(3,14))
+                cls = context.tree.body[0]
+                self.assertEqual(context.index._static_attributes[cls],expected)
+
+    def test_eager_class_static_attributes_are_not_fabricated_as_an_empty_tuple(self):
+        context,func,result = self._class_header_solve("class C:\n    def m(self):\n        self.x=1\n"
+            "item=C.__static_attributes__[0]\nmarker=int",semantic_key=(3,14))
+        self.assertTrue(result.complete,result.reasons)
+        self.assertTrue(result.must_execute(func.body[-1]))
+        self.assertEqual(result.exits[0].lookup(context.index.node_id(func),"item"),_ProofValue.literal("x"))
+
+    def test_eager_class_annotation_mapping_uses_load_name_not_global_declaration(self):
+        context,func,result = self._eager_annotation_solve("global __annotations__\n__annotations__={}\nclass C:\n"
+            "    global __annotations__\n    value:int\n    item=__annotations__['value']\nmarker=int",(3,12),
+            extra_globals=(("__annotations__",_ProofValue.absent()),))
+        self.assertTrue(result.complete,result.reasons)
+        self.assertEqual(result.exits[0].pending.error_kind,"KeyError")
+        self.assertTrue(result.target_unreachable(func.body[-1]))
+
+    def test_eager_class_annotation_mapping_mutation_is_not_quiet(self):
+        context,func,result = self._eager_annotation_solve("class C:\n    value:int\nmarker=1",(3,12))
+        cls = func.body[0]
+        self.assertTrue(result.complete,result.reasons)
+        before = result.states_at(cls.body[0])[0]
+        quiet = result.quiet_prefix(cls.body[0],before)
+        self.assertTrue(quiet.complete,quiet.reasons)
+        self.assertFalse(quiet.value)
+
+    def test_eager_class_future_detection_does_not_rescan_the_module_per_annotation(self):
+        source = "pass\n"*200+"def f():\n    class C:\n"+"        value:int\n"*32
+        with mock.patch(__name__+"._future_annotations",wraps=_future_annotations) as scan:
+            context = _ProofContext(source,semantic_key=(3,12))
+            func = context.tree.body[-1]
+            seed = _ProofState().bind(0,"__name__",_ProofValue.literal("fixture"))
+            result = context.solve(func,entry=(seed,))
+        self.assertTrue(result.complete,result.reasons)
+        self.assertLessEqual(scan.call_count,4)
+
+    def test_eager_class_static_epilogue_checks_the_name_cap_before_type_failure(self):
+        body = "try:\n    class C:\n        __qualname__=1\nexcept TypeError:\n    marker=1"
+        for cap,want in ((3,False),(4,True),(5,True)):
+            context,func,result = self._class_header_solve(body,semantic_key=(3,14),limits={"names":cap})
+            self.assertEqual(result.complete,want,result.reasons)
+            if not want:
+                self.assertIn("name-budget",result.reasons)
+
+    def test_eager_class_static_metadata_roundtrip_checks_source_owned_tuple_items(self):
+        context = _ProofContext("def make():\n    class C:\n        def m(self):\n            self.x=1\n"
+            "    return C\ndef read(provided):\n    marker=provided.__static_attributes__[0]\n",semantic_key=(3,14))
+        make,read = context.tree.body
+        seed = _ProofState().bind(0,"__name__",_ProofValue.literal("fixture"))
+        built = context.solve(make,entry=(seed,))
+        self.assertTrue(built.complete,built.reasons)
+        state = built.exits[0]
+        state = replace(state,pending=_ProofCompletion()).bind(context.index.node_id(read),"provided",state.pending.value)
+        good = context.solve(read,entry=(state,))
+        self.assertTrue(good.complete,good.reasons)
+        self.assertEqual(good.exits[0].lookup(context.index.node_id(read),"marker"),_ProofValue.literal("x"))
+        bad = replace(state,collection_objects=tuple(replace(item,items=(_ProofValue.literal("wrong"),))
+            if item.identity[3]=="static-attributes" else item for item in state.collection_objects))
+        result = context.solve(read,entry=(bad,))
+        self.assertFalse(result.complete)
+
+    def test_eager_class_static_attributes_exclude_optimized_assertion_code(self):
+        context,func,result = self._class_header_solve("class C:\n    def m(self):\n"
+            "        assert [1 for self.x in()]\nitem=C.__static_attributes__[0]\nmarker=int",semantic_key=(3,14))
+        self.assertTrue(result.complete,result.reasons)
+        if sys.flags.optimize:
+            self.assertEqual(result.exits[0].pending.error_kind,"IndexError")
+            self.assertTrue(result.target_unreachable(func.body[-1]))
+        else:
+            self.assertEqual(result.exits[0].lookup(context.index.node_id(func),"item"),_ProofValue.literal("x"))
+            self.assertTrue(result.must_execute(func.body[-1]))
+
+    def test_eager_class_future_annotations_create_the_map_without_evaluating_names(self):
+        for version in ((3,12),(3,14)):
+            context = _ProofContext("from __future__ import annotations\nclass C:\n    value:missing\n"
+                "    del __annotations__\n    marker=1\n",semantic_key=version)
+            cls = context.tree.body[-1]
+            result = context.solve(cls)
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual(result.exits[0].lookup(context.index.node_id(cls),"marker"),_ProofValue.literal(1))
+
 
     def test_class_header_base_walrus_binds_the_enclosing_scope(self):
         context,func,snapshot = self._class_header_solve("class C((present:=object)):\n    pass\ndel present\nmarker=int")
