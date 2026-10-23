@@ -256,6 +256,12 @@ class PartialReceipt(unittest.TestCase):
                                    "received": 39419, "ring": 581, "drop": 0,
                                    "trunc": 0, "queue": 0})
 
+    def test_valid_receipt_must_match_the_invoked_calls(self):
+        self.assertIsNotNone(lane.partial_receipt(self.OCT13_LOG, 20000))
+        for calls in (19999, 20001):
+            with self.subTest(calls=calls):
+                self.assertIsNone(lane.partial_receipt(self.OCT13_LOG, calls))
+
     def test_split_receipts_accepted(self):
         receipt = lane.partial_receipt(
             _partial_output(9, 9, 18, 1, 0, 0, 1, 2), 10)
@@ -2048,7 +2054,7 @@ class PrepareDriving(unittest.TestCase):
 
     def _drive_prepare(self, root, out, cargo_bytes, listing,
                        run_hook=None, check_hook=None,
-                       forbid_plain_check_output=False):
+                       forbid_plain_check_output=False, cargo_code=0):
         saved_flag = lane._CANCEL_REQUESTED
         info = {"planted": [], "observed": [], "check_calls": []}
         metadata = json.dumps({"packages": [
@@ -2079,7 +2085,7 @@ class PrepareDriving(unittest.TestCase):
                 return (0, False, listing)
             if command[1] == "xtask":
                 return (0, False, b"")
-            return (0, False, cargo_bytes)
+            return (cargo_code, False, cargo_bytes)
 
         def fake_check_output_plain(*args, **kwargs):
             raise AssertionError("plain check_output used")
@@ -2182,6 +2188,63 @@ class PrepareDriving(unittest.TestCase):
             self.assertEqual(len(planted_paths), 1)
             self.assertEqual(planted_paths[0].read_bytes(),
                              planted)
+
+    def test_prepare_cargo_rejects_success_planted_over_failed_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host_debug, gen, out = self._scaffold(root)
+            success = self._cargo_payload(host_debug)
+            failure = b'{"reason":"build-finished","success":false}\n'
+            planted = []
+
+            def plant(command, log):
+                if command[1:2] in (["build"], ["test"]):
+                    Path(log).write_bytes(success)
+                    planted.append(Path(log))
+
+            outcome, error, info = self._drive_prepare(
+                root, out, failure, b"", run_hook=plant)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, ValueError)
+            self.assertEqual(str(error), "Cargo build failed")
+            self.assertFalse((out / "manifest.json").exists())
+            self.assertEqual(len(planted), 1)
+            self.assertEqual(planted[0].read_bytes(), success)
+            self.assertTrue(lane.cargo_artifacts(success.decode("utf-8")))
+
+    def test_prepare_listing_rejects_success_planted_over_failed_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host_debug, gen, out = self._scaffold(root)
+            success = b"listed_body: test\n1 test, 0 benchmarks\n"
+            planted = []
+
+            def plant(command, log):
+                if "--list" in command:
+                    Path(log).write_bytes(success)
+                    planted.append(Path(log))
+
+            outcome, error, info = self._drive_prepare(
+                root, out, self._cargo_payload(host_debug),
+                b"not-a-test-list\n", run_hook=plant)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, ValueError)
+            self.assertIn("unexpected libtest listing", str(error))
+            self.assertFalse((out / "manifest.json").exists())
+            self.assertEqual(len(planted), 1)
+            self.assertEqual(planted[0].read_bytes(), success)
+            self.assertEqual(lane.parse_test_list(success.decode()), ["listed_body"])
+
+    def test_prepare_nonzero_build_cannot_supply_valid_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host_debug, gen, out = self._scaffold(root)
+            outcome, error, info = self._drive_prepare(
+                root, out, self._cargo_payload(host_debug), b"", cargo_code=1)
+            self.assertEqual(outcome, "raised")
+            self.assertIsInstance(error, ValueError)
+            self.assertIn("host-build failed (1)", str(error))
+            self.assertFalse((out / "manifest.json").exists())
 
     def test_prepare_checkpoint_aborts_between_staged_rows(self):
         # the per-row staging checkpoint (N6): the flag set
@@ -2541,6 +2604,132 @@ class ExecuteWiring(unittest.TestCase):
             self.assertIn("lane evidence publishing failed", str(error))
             self.assertEqual(self._umount_targets(calls),
                              list(reversed(self._mount_targets(calls))))
+            self._assert_lock_released(lock)
+
+    def _assert_single_failed_row(self, out, code, name, expected_exit=None):
+        self.assertEqual(code, 1)
+        rows = json.loads((out / "results.json").read_text())
+        failures = [row for row in rows if row["status"] == "FAIL"]
+        self.assertEqual([row["test"] for row in failures], [name])
+        failed = failures[0]
+        if expected_exit is not None:
+            self.assertEqual(failed["exit"], expected_exit)
+            self.assertFalse(failed["timed_out"])
+        self.assertNotIn("accepted_partial", failed)
+        summary = json.loads((out / "summary.json").read_text())
+        self.assertEqual(summary["accepted_partials"], [])
+        self.assertEqual(summary["counts"]["FAIL"], 1)
+        self.assertEqual(summary["exit"], 1)
+        self.assertIs(summary["complete"], True)
+        return failed
+
+    def test_selftest_rejects_success_planted_over_failed_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            success = PartialReceipt.OCT13_LOG.encode()
+            support = json.dumps({"audit": "attach", "attached": lane.LIFECYCLE_REQUIRED,
+                                  "expected": lane.LIFECYCLE_EXPECTED}).encode()
+
+            def routed(command, log, *args, **kwargs):
+                if command[1:2] == ["report"]:
+                    return (0, False, support)
+                if command[1:3] == ["selftest", "bpf"]:
+                    Path(log).write_bytes(success)
+                    return (3, False, b"reconcile: partial\n")
+                if command[1:3] == ["selftest", "token-smoke"]:
+                    Path(log).write_bytes(b"token roundtrip ok\n")
+                    return (0, False, b"token roundtrip ok\n")
+                return (0, False, b"")
+
+            outcome, code, calls, printed = self._drive(root, out, lock, run_logged=routed)
+            self.assertEqual(outcome, "returned")
+            failed = self._assert_single_failed_row(out, code, "selftest-bpf", 3)
+            self.assertEqual((out / failed["log"]).read_bytes(), success)
+            self.assertIsNotNone(lane.partial_receipt(success.decode(), 20000))
+            self._assert_lock_released(lock)
+
+    def test_lifecycle_rejects_success_planted_over_failed_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root)
+            success = json.dumps({"audit": "attach", "attached": lane.LIFECYCLE_REQUIRED,
+                                  "expected": lane.LIFECYCLE_EXPECTED}).encode()
+
+            def routed(command, log, *args, **kwargs):
+                if command[1:2] == ["report"]:
+                    Path(log).write_bytes(success)
+                    return (0, False, b"no lifecycle announcement here\n")
+                return (0, False, b"")
+
+            outcome, code, calls, printed = self._drive(root, out, lock, run_logged=routed)
+            self.assertEqual(outcome, "returned")
+            failed = self._assert_single_failed_row(out, code, "lifecycle-support")
+            self.assertEqual((out / failed["log"]).read_bytes(), success)
+            self.assertEqual(lane.lifecycle_verdict(0, success.decode()), "PASS")
+            self._assert_lock_released(lock)
+
+    def test_cargo_body_rejects_success_planted_over_failed_capture(self):
+        body = "capture_failure_probe"
+        artifact = {"package": "kryprobe-policy", "target": "rule_unit", "test": "probe_bin",
+                    "staged": "stage/debug/probe_bin", "bodies": [body],
+                    "features": [], "sha256": "0" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root, artifacts=[artifact])
+            success = PASS.encode()
+            failure = b"test result: ok. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
+            listing = (body + ": test\n1 test, 0 benchmarks\n").encode()
+            support = json.dumps({"audit": "attach", "attached": lane.LIFECYCLE_REQUIRED,
+                                  "expected": lane.LIFECYCLE_EXPECTED}).encode()
+
+            def routed(command, log, *args, **kwargs):
+                if "--list" in command:
+                    return (0, False, listing)
+                if "--exact" in command:
+                    Path(log).write_bytes(success)
+                    return (0, False, failure)
+                if command[1:2] == ["report"]:
+                    return (0, False, support)
+                return (0, False, b"")
+
+            outcome, code, calls, printed = self._drive(root, out, lock, run_logged=routed)
+            self.assertEqual(outcome, "returned")
+            failed = self._assert_single_failed_row(out, code, body, 0)
+            self.assertEqual((out / failed["log"]).read_bytes(), success)
+            self.assertEqual(lane.body_verdict(0, success.decode()), "PASS")
+            self._assert_lock_released(lock)
+
+    def test_e2e_rejects_success_planted_over_missing_child_receipt(self):
+        body = "selftest_bpf_clean_partial_or_denied"
+        artifact = {"package": "kryprobe-cli", "target": "cli_bpf_e2e", "test": "e2e_bin",
+                    "staged": "stage/debug/e2e_bin", "bodies": [body],
+                    "features": [], "sha256": "0" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, lock = self._prepared_out(root, artifacts=[artifact])
+            captured = PASS.encode() + b"selftest bpf: accounted partial\n"
+            success = captured + PartialReceipt.OCT13_LOG.encode()
+            listing = (body + ": test\n1 test, 0 benchmarks\n").encode()
+            support = json.dumps({"audit": "attach", "attached": lane.LIFECYCLE_REQUIRED,
+                                  "expected": lane.LIFECYCLE_EXPECTED}).encode()
+            self.assertEqual(lane.body_verdict(0, captured.decode()), "PASS")
+
+            def routed(command, log, *args, **kwargs):
+                if "--list" in command:
+                    return (0, False, listing)
+                if "--exact" in command:
+                    Path(log).write_bytes(success)
+                    return (0, False, captured)
+                if command[1:2] == ["report"]:
+                    return (0, False, support)
+                return (0, False, b"")
+
+            outcome, code, calls, printed = self._drive(root, out, lock, run_logged=routed)
+            self.assertEqual(outcome, "returned")
+            failed = self._assert_single_failed_row(out, code, body, 0)
+            self.assertEqual((out / failed["log"]).read_bytes(), success)
+            self.assertIsNotNone(lane.partial_receipt(success.decode(), 20000))
             self._assert_lock_released(lock)
 
     def test_verdicts_follow_captured_bytes_not_paths(self):
