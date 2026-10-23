@@ -4399,8 +4399,10 @@ class _ProofScopeIndex:
                 outer = enclosing[outer]
         self._captures = MappingProxyType({owner: frozenset(names) for owner, names in captures.items()})
         self._cells = MappingProxyType({owner: frozenset(names) for owner, names in cells.items()})
-        self._definition_parts = MappingProxyType({node: _proof_definition_parts(node, eager)
-            for node in local if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))})
+        self._definition_parts = MappingProxyType({node: (
+            () if isinstance(node, ast.ClassDef) else _proof_definition_parts(node, eager))
+            for node in local if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+            or (isinstance(node, ast.ClassDef) and all(isinstance(part, ast.Pass) for part in node.body))})
         self._invalid_deferred_annotations = frozenset(annotation_definitions[owners[id(node)]]
             for node in nodes.values() if isinstance(node, ast.NamedExpr) and owners[id(node)] in annotation_definitions)
         deferred_captures = {}
@@ -4439,6 +4441,8 @@ class _ProofScopeIndex:
                 roles.append("transfer" if isinstance(node, (ast.Return, ast.Raise, ast.Break, ast.Continue)) else "after")
             if isinstance(node, ast.Call):
                 roles.append("invoke")
+            if isinstance(node, ast.ClassDef):
+                roles.append("build")
             if id(node) in decorator_nodes:
                 roles.append("apply")
             if isinstance(node, ast.For):
@@ -4871,12 +4875,12 @@ class _ProofState:
                       and type(frame[2]) is tuple and bool(frame[2]))
         if self.pending.value is not None:
             values.append(self.pending.value)
-        count = len(self.borrowed_exceptions) + sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method", "type-union", "function", "closure-cell")
+        count = len(self.borrowed_exceptions) + sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method", "type-union", "function", "closure-cell", "class")
                                                  for value in values for atom in value.atoms)
-        count += sum(region[0] == "function" for region, name, value in self.regions)
+        count += sum(region[0] in ("function", "class") for region, name, value in self.regions)
         for frame in self.continuation:
             if frame and frame[0] == "finally" and frame[2][3] is not None:
-                count += sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method", "type-union", "function", "closure-cell") for atom in frame[2][3][0])
+                count += sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method", "type-union", "function", "closure-cell", "class") for atom in frame[2][3][0])
                 values.append(_ProofValue(*frame[2][3]))
         error_roots = [self.pending.error, self.active, self.managers]
         for frame in self.continuation:
@@ -5103,6 +5107,11 @@ class _ProofEffects:
         return len(token) == 2 and token[0] == "exception" and cls.exception_name(token[1]) is not None
 
     @classmethod
+    def owned_marker(cls, value):
+        token = cls.single(value)
+        return token is not None and cls.closed_leaf(token) and token == ("literal","bool",True)
+
+    @classmethod
     def union_types(cls, token):
         """Flat closed descriptor; native class identities, never user hooks."""
         if type(token) is not tuple or len(token) != 3 or type(token[0]) is not str or token[0] != "type-union" \
@@ -5124,7 +5133,7 @@ class _ProofEffects:
         if any(token[0] == "native" and (len(token) != 2 or type(token[1]) is not str
                 or token[1] not in cls._builtin_names) for token in tokens):
             raise _ProofIncomplete("unsupported-native-operand")
-        if any(token[0] == "stdlib-class" for token in tokens):
+        if any(token[0] in ("stdlib-class", "class") for token in tokens):
             raise _ProofIncomplete("unsupported-union-class")
         # The entry contract also admits these legacy builtin tokens. Their
         # runtime objects are the same singletons as ordinary literal loads.
@@ -5367,7 +5376,7 @@ class _ProofEffects:
     def exception_work(cls, state, extra=()):
         values = list(cls.exception_values(state)) + list(extra)
         count = 1 + len(state.active) + len(state.managers) + len(state.continuation)
-        count += sum(region[0] == "function" for region, name, value in state.regions)
+        count += sum(region[0] in ("function", "class") for region, name, value in state.regions)
         count += sum(4 + len(frame[4]) for frame in state.managers
                      if frame and frame[0] == "suppress" and len(frame) == 5 and type(frame[4]) is tuple)
         count += sum(3 + len(frame[6]) + len(frame[8]) for frame in state.continuation
@@ -5397,7 +5406,7 @@ class _ProofEffects:
         owned_functions = set()
         for region, name, value in state.regions:
             regions.setdefault(region, []).append(value)
-            if region[0] == "function" and name == "$owned" and value == _ProofValue.literal(True):
+            if region[0] in ("function", "class") and name == "$owned" and cls.owned_marker(value):
                 owned_functions.add(region)
         bindings = {(owner, name): value for owner, name, value in state.bindings}
         pending = [value.atoms for value in (cls.exception_values(state) if include_state else ()) + tuple(extra)]
@@ -5438,10 +5447,10 @@ class _ProofEffects:
                 if region not in seen_regions:
                     seen_regions.add(region)
                     values(regions.get(region, ()))
-            elif type(part) is tuple and part and part[0] == "function":
+            elif type(part) is tuple and part and part[0] in ("function", "class"):
                 if len(part) != 2 or type(part[1]) is not int:
-                    raise _ProofIncomplete("unsupported-function-reference")
-                region = ("function", part[1])
+                    raise _ProofIncomplete("unsupported-owned-reference")
+                region = (part[0], part[1])
                 if region not in owned_functions:
                     unsafe.add(part)  # Legacy/borrowed callable retains unknown edges.
                 if region not in seen_regions:
@@ -5464,8 +5473,8 @@ class _ProofEffects:
             return False
         token = cls.single(value)
         return cls.closed_value(value) or (token[0] in ("namespace", "opaque")) \
-            or (state is not None and len(token) == 2 and token[0] == "function" and type(token[1]) is int
-                and state.region_value(("function", token[1]), "$owned") == _ProofValue.literal(True)) \
+            or (state is not None and len(token) == 2 and token[0] in ("function", "class") and type(token[1]) is int
+                and cls.owned_marker(state.region_value((token[0], token[1]), "$owned"))) \
             or (token[0] == "exception-method" and len(token) == 3 and token[2] in ("split", "subgroup")
                 and state is not None and state.exception_object(token[1]) is not None) \
             or (token[0] == "collection" and state is not None and state.collection_object(token) is not None)
@@ -5591,7 +5600,7 @@ class _ProofEffects:
         live, held, unused, unknown, regions = cls.reachable(state)
         objects = tuple(item for item in state.exception_objects if item.payload in live)
         collections = tuple(item for item in state.collection_objects if item.identity in held)
-        retained_regions = tuple(item for item in state.regions if item[0][0] not in ("suppress", "function") or item[0] in regions)
+        retained_regions = tuple(item for item in state.regions if item[0][0] not in ("suppress", "function", "class") or item[0] in regions)
         if objects == state.exception_objects and collections == state.collection_objects and retained_regions == state.regions:
             return state
         return replace(state, exception_objects=objects, collection_objects=collections, regions=retained_regions,
@@ -5711,6 +5720,8 @@ class _ProofEffects:
             if atom and atom[0] == "native" and atom[1] in cls._exception_mros:
                 result.append(cls._exception_mros[atom[1]][0])
                 continue
+            if atom and atom[0] == "class":
+                raise _ProofIncomplete("unsupported-nominal-group-matcher")
             if atom is None or atom[0] in ("opaque", "exception-types"):
                 raise _ProofIncomplete("unknown-group-matcher")
             if info is None and (atom[0] in ("function", "const-callable", "exception-method", "stdlib-protocol") or (
@@ -5748,6 +5759,9 @@ class _ProofEffects:
                 candidate_name = cls._exception_mros.get(token[1], (token[1],))[0]
                 if candidate_name in cls._exception_mros[name]:
                     return True, None
+                continue
+            if token[0] == "class":
+                cls.class_base(candidate, state, charge)  # A native error is never an instance of this new child.
                 continue
             if token == cls._suppress_class:
                 # ABCMeta may consult a virtual-subclass registry not carried
@@ -5914,6 +5928,8 @@ class _ProofEffects:
         for member in members:
             if member and member[0] == "native" and member[1] in cls._exception_mros:
                 candidates.append(cls._exception_mros[member[1]][0])
+            elif member and member[0] == "class":
+                raise _ProofIncomplete("unsupported-nominal-star-matcher")
             elif member and member[0] != "opaque":
                 return None, "TypeError"
             else:
@@ -5924,23 +5940,32 @@ class _ProofEffects:
         return ("types", tuple(candidates)), None
 
     @classmethod
-    def handler_match(cls, value, error, state=None):
+    def handler_match(cls, value, error, state=None, charge=None):
         token = cls.single(value)
         sequence = cls.sequence_info(value, state)
         members = tuple(cls.single(item) for item in sequence[0]) if sequence is not None and token[1] == "tuple" \
             else token[1] if token and token[0] == "exception-types" else (token,)
         candidates = []
+        nominal = False
         for member in members:
             if member and member[0] == "native":
                 if member[1] not in cls._exception_mros:
                     return None, "TypeError"
                 candidates.append(cls._exception_mros[member[1]][0])
+            elif member and member[0] == "class":
+                if cls.class_base(_ProofValue(frozenset({member})), state, charge) == "object":
+                    return None, "TypeError"
+                nominal = True
+                # The solver currently constructs only native exception payloads.
+                # None can be an instance of a freshly allocated nominal child.
             elif member and member[0] in ("literal", "singleton", "namespace", "plain-object", "plain-string",
                                         "const-callable", "exception", "exception-types", "sequence", "collection", "type-union",
                                         "stdlib-class", "stdlib-protocol"):
                 return None, "TypeError"
             else:
                 raise _ProofIncomplete("opaque-handler-type")
+        if nominal and cls.exception_name(error) is None:
+            raise _ProofIncomplete("unknown-exception-match")
         if not candidates:
             return False, None
         name = cls.exception_name(error)
@@ -5976,7 +6001,7 @@ class _ProofEffects:
         work = 0
         for value in values:
             token = cls.single(value)
-            if token and token[0] == "function":
+            if token and token[0] in ("function", "class"):
                 work += len(state.regions)
             elif token and token[0] == "collection":
                 work += len(state.collection_objects)
@@ -6008,15 +6033,56 @@ class _ProofEffects:
                 raise _ProofIncomplete("unsupported-function-entry")
             expected_cells = {"cell:" + str(owner) + ":" + name:
                 _ProofValue(frozenset({("closure-cell", owner, name)})) for owner, name in cells}
-            if rows.get("$owned") != _ProofValue.literal(True) \
-                    or set(rows) != {"$owned", "$builtins", *(label for label, part in parts), *expected_cells} \
+            implicit = {"$module"} if isinstance(node, ast.ClassDef) else set()
+            if not cls.owned_marker(rows.get("$owned",_ProofValue.absent())) \
+                    or set(rows) != {"$owned", "$builtins", *implicit, *(label for label, part in parts), *expected_cells} \
                     or any(rows[name] != value for name, value in expected_cells.items()):
                 raise _ProofIncomplete("unsupported-function-entry")
             values = tuple(rows[label] for label, part in parts) + (rows["$builtins"],)
+            if isinstance(node,ast.ClassDef) and not rows["$module"].unknown:
+                values += (rows["$module"],)
             charge(cls.capture_lookup_work(values, state))
             if any(not cls.retained_value(value, state) for value in values):
                 raise _ProofIncomplete("unsupported-function-entry")
         return frozenset(functions)
+
+    @classmethod
+    def class_base(cls, value, state, charge=None):
+        token = cls.single(value)
+        if not token or len(token) != 2 or token[0] != "class" or type(token[1]) is not int or state is None:
+            raise _ProofIncomplete("unsupported-class-reference")
+        if charge is not None:
+            charge(1 + 2 * len(state.regions))
+        if not cls.owned_marker(state.region_value(token, "$owned")):
+            raise _ProofIncomplete("unsupported-class-reference")
+        base = cls.single(state.region_value(token, "$base"))
+        if not base or len(base) != 2 or base[0] != "native" or type(base[1]) is not str or (
+                base[1] != "object" and base[1] not in cls._exception_mros):
+            raise _ProofIncomplete("unsupported-class-base")
+        return cls._exception_mros.get(base[1], (base[1],))[0]
+
+    @classmethod
+    def validate_class_rows(cls, index, state, charge):
+        classes = {}
+        for region, name, value in state.regions:
+            if region[0] == "class":
+                classes.setdefault(region, {})[name] = value
+        for region, rows in classes.items():
+            charge(3)
+            node = index._nodes.get(region[1])
+            if not isinstance(node, ast.ClassDef) or node.type_params \
+                    or not all(isinstance(part, ast.Pass) for part in node.body) \
+                    or set(rows) != {"$owned", "$base", "$module"}:
+                raise _ProofIncomplete("unsupported-class-entry")
+            base = cls.single(rows["$base"])
+            if not cls.owned_marker(rows["$owned"]) or not base or len(base) != 2 \
+                    or base[0] != "native" or type(base[1]) is not str \
+                    or (base[1] != "object" and base[1] not in cls._exception_mros):
+                raise _ProofIncomplete("unsupported-class-entry")
+            metadata = cls.single(rows["$module"])
+            if not metadata or metadata[:2] != ("literal", "str") or not cls.closed_leaf(metadata):
+                raise _ProofIncomplete("unsupported-class-entry")
+        return frozenset(classes)
 
     @classmethod
     def iterator_next(cls, value):
@@ -6134,7 +6200,7 @@ class _ProofEffects:
         # Compiler-generated __module__ ignores enclosing lexical parameters.
         # Opaque metadata (even a str subclass) can run __set_name__ here.
         metadata = cls.single(cls.global_value(index, scope, state, "__name__"))
-        if not metadata or metadata[:2] != ("literal", "str"):
+        if not metadata or metadata[:2] != ("literal", "str") or not cls.closed_leaf(metadata):
             raise _ProofIncomplete("class-metadata")
         return _ProofValue(frozenset({("empty-class", index.node_id(node))}))
 
@@ -6181,8 +6247,8 @@ class _ProofEffects:
 
     @classmethod
     def region_value(cls, index, scope, state, region, name):
-        if region[0] == "function":
-            raise _ProofIncomplete("internal-function-region")
+        if region[0] in ("function", "class"):
+            raise _ProofIncomplete("internal-owned-region")
         if state.region_defined(region, name):
             return state.region_value(region, name)
         if region == ("contextlib", 0):
@@ -6382,8 +6448,8 @@ class _ProofEffects:
         if atom is None or atom[0] != "namespace":
             raise _ProofIncomplete("opaque-member")
         _, view, region = atom
-        if region[0] == "function":
-            raise _ProofIncomplete("internal-function-region")
+        if region[0] in ("function", "class"):
+            raise _ProofIncomplete("internal-owned-region")
         if attribute:
             if view == "object" and key.startswith("__"):
                 raise _ProofIncomplete("object-protocol-member")
@@ -6688,8 +6754,8 @@ class _ProofEffects:
         if atom is None or atom[0] != "namespace":
             raise _ProofIncomplete("opaque-store")
         _, view, region = atom
-        if region[0] == "function":
-            raise _ProofIncomplete("internal-function-region")
+        if region[0] in ("function", "class"):
+            raise _ProofIncomplete("internal-owned-region")
         if region == ("contextlib", 0) and key == "suppress":
             # Rebinding can retire the original class and its opaque members;
             # never silently keep that class alive as a borrowed global root.
@@ -7243,6 +7309,8 @@ class _ProofContext:
             return ("TypeError", "AttributeError", "NameError")
         if isinstance(node, ast.ImportFrom):
             return ("ImportError",)
+        if isinstance(node, ast.ClassDef):
+            return ("NameError", "TypeError")
         if isinstance(node, ast.Assert):
             return ("AssertionError",)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
@@ -7382,7 +7450,7 @@ class _ProofContext:
                     if nesting > 3 * limits["depth"] + 16:
                         return "depth-budget"
                     if type(value) is tuple and value and type(value[0]) is str:
-                        if value[0] == "function" and (len(value) != 2 or type(value[1]) is not int):
+                        if value[0] in ("function", "class") and (len(value) != 2 or type(value[1]) is not int):
                             return "unsupported-function-entry"
                         if value[0] == "closure-cell" and (len(value) != 3 or type(value[1]) is not int
                                                           or type(value[2]) is not str):
@@ -7407,6 +7475,30 @@ class _ProofContext:
             total += memo[id(root)][0] if type(root) in (tuple, frozenset) else 1
             if total > limits["steps"]:
                 return "work-budget"
+        # Owned records promise a closed retained graph. Check their literal
+        # values before cache keys can equate malformed bool1 with True.
+        # Unused free bindings remain hypotheses: an optimized-out assertion
+        # must not start reading or validating its operand.
+        held = [value.atoms for region,name,value in state.regions if region[0] in ("function","class")]
+        held.extend(value.atoms for item in state.exception_objects for value in item.values())
+        held.extend(value.atoms for item in state.collection_objects for value in item.items)
+        checked = set()
+        while held:
+            atoms = held.pop()
+            if id(atoms) in checked:
+                continue
+            if type(atoms) is not frozenset or any(type(atom) is not tuple or not atom for atom in atoms):
+                return "unsupported-composite-entry"
+            checked.add(id(atoms))
+            for atom in atoms:
+                if atom[0] == "literal" and not _ProofEffects.closed_leaf(atom):
+                    return "unsupported-literal-entry"
+                shape = _ProofEffects.sequence_shape(atom)
+                if shape is not None:
+                    if any(type(child) is not frozenset or len(child) != 1
+                           or any(type(part) is not tuple or not part for part in child) for child in shape[0]):
+                        return "unsupported-composite-entry"
+                    held.extend(shape[0])
         return None
 
     def solve(self, scope=None, entry=None):
@@ -7483,7 +7575,7 @@ class _ProofContext:
                        for region, name, value in state.regions):
                     reasons.append("foreign-region")
                     return snapshot()
-                function_metadata = any(len(region) == 2 and region[0] == "function"
+                function_metadata = any(len(region) == 2 and region[0] in ("function", "class")
                                         for region, name, value in state.regions)
                 if function_metadata and (state.epoch is None or any(len(region) == 2 and region[0] == "function"
                         and type(region[1]) is not int for region, name, value in state.regions)):
@@ -7664,9 +7756,11 @@ class _ProofContext:
                         return snapshot()
                 try:
                     self._charge(stats, len(state.regions))
-                    if any(region[0] == "function" for region, name, value in state.regions):
+                    if any(region[0] in ("function", "class") for region, name, value in state.regions):
                         self._charge(stats, _ProofEffects.exception_work(state))
                     function_regions = _ProofEffects.validate_function_rows(self.index, state,
+                        lambda amount: self._charge(stats, amount))
+                    class_regions = _ProofEffects.validate_class_rows(self.index, state,
                         lambda amount: self._charge(stats, amount))
                 except _ProofIncomplete as error:
                     reasons.append(str(error))
@@ -7694,7 +7788,7 @@ class _ProofContext:
                         return snapshot()
                     for atom in atoms:
                         if atom[0] == "closure-cell" or (atom[0] == "namespace" and len(atom) == 3
-                                and type(atom[2]) is tuple and atom[2] and atom[2][0] == "function"):
+                                and type(atom[2]) is tuple and atom[2] and atom[2][0] in ("function", "class")):
                             reasons.append("internal-function-region")
                             return snapshot()
                         if atom[0] == "function":
@@ -7702,6 +7796,9 @@ class _ProofContext:
                                     or self.index._nodes.get(atom[1]) not in self.index._definition_parts:
                                 reasons.append("unsupported-function-entry")
                                 return snapshot()
+                        if atom[0] == "class" and atom not in class_regions:
+                            reasons.append("unsupported-class-entry")
+                            return snapshot()
                         if atom[0] == "type-union":
                             members = _ProofEffects.union_types(atom)
                             if members is None:
@@ -7770,10 +7867,10 @@ class _ProofContext:
                             reasons.append("unsupported-composite-entry")
                             return snapshot()
                         held.extend((child, True) for child in children)
-                if function_regions:
+                if function_regions or class_regions:
                     try:
                         self._charge(stats, 2 * _ProofEffects.exception_work(state))
-                        if not function_regions <= _ProofEffects.reachable(state)[4]:
+                        if not (function_regions | class_regions) <= _ProofEffects.reachable(state)[4]:
                             raise _ProofIncomplete("orphan-function-metadata")
                     except _ProofIncomplete as error:
                         reasons.append(str(error))
@@ -7829,7 +7926,7 @@ class _ProofContext:
                     if region == ("suppress-class", 0) and name not in _ProofEffects._suppress_hooks:
                         reasons.append("unsupported-suppress-class-entry")
                         return snapshot()
-                    if len(region) != 2 or region[0] not in ("globals", "builtins", "mapping", "object", "suppress", "contextlib", "suppress-class", "function") \
+                    if len(region) != 2 or region[0] not in ("globals", "builtins", "mapping", "object", "suppress", "contextlib", "suppress-class", "function", "class") \
                             or type(region[1]) is not int or (
                                 region[0] in ("globals", "builtins", "contextlib", "suppress-class") and region[1] != 0):
                         reasons.append("foreign-region")
@@ -8063,7 +8160,7 @@ class _ProofContext:
         def prune_graph(state):
             self._charge(stats, len(state.regions))
             if state.exception_objects or state.collection_objects or any(
-                    region[0] == "function" for region, name, value in state.regions):
+                    region[0] in ("function", "class") for region, name, value in state.regions):
                 reserve_graph(state)
                 return _ProofEffects.prune_exception_objects(state)
             return state
@@ -8287,10 +8384,11 @@ class _ProofContext:
         def make_function(node, values, current):
             parts = self.index._definition_parts[node]
             cells = self.index._function_cells[node]
-            self._charge(stats, 2 + len(parts) + len(cells))
+            body_function = isinstance(node, ast.ClassDef)
+            self._charge(stats, 2 + len(parts) + len(cells) + body_function)
             if len(values) != len(parts):
                 raise _ProofIncomplete("invalid-function-captures")
-            if 2 + len(parts) + len(cells) > self.limits["names"]:
+            if 2 + len(parts) + len(cells) + body_function > self.limits["names"]:
                 raise _ProofIncomplete("name-budget")
             if any(not isinstance(self.index.node_for_id(cell_owner), (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
                    for cell_owner, name in cells):
@@ -8314,7 +8412,7 @@ class _ProofContext:
             reachable = _ProofEffects.reachable(current)
             if region in reachable[4] or any(owner == region for owner, name, value in current.regions):
                 raise _ProofIncomplete("repeated-function-allocation")
-            if current.alias_count() + 3 + len(parts) + len(cells) > self.limits["aliases"]:
+            if current.alias_count() + 3 + len(parts) + len(cells) + body_function > self.limits["aliases"]:
                 raise _ProofIncomplete("alias-budget")
             selected = _ProofEffects.region_value(self.index, scope, current, ("globals", 0), "__builtins__")
             if selected == _ProofValue.absent():
@@ -8330,6 +8428,15 @@ class _ProofContext:
             result = _ProofValue(frozenset({("function", site)}))
             current = current.write_region(region, "$owned", _ProofValue.literal(True))
             current = current.write_region(region, "$builtins", selected)
+            if body_function:
+                # PyFunction_New captures global __name__ independently of
+                # the body code's later LOAD_NAME for class __module__.
+                module = _ProofEffects.region_value(self.index, scope, current, ("globals", 0), "__name__")
+                module = _ProofValue.literal(None) if module == _ProofValue.absent() else module
+                self._charge(stats,len(module.atoms)+_ProofEffects.capture_lookup_work((module,),current))
+                if not module.unknown and not _ProofEffects.retained_value(module,current):
+                    raise _ProofIncomplete("unsupported-function-module")
+                current = current.write_region(region, "$module",module)
             for (label, expression_node), value in zip(parts, values):
                 current = current.write_region(region, label, value)
             for cell_owner, name in cells:
@@ -8341,7 +8448,7 @@ class _ProofContext:
         def name_call(callee, argument, current):
             token = _ProofEffects.single(callee)
             if not token or len(token) != 2 or token[0] != "function" \
-                    or current.region_value(("function", token[1]), "$owned") != _ProofValue.literal(True):
+                    or not _ProofEffects.owned_marker(current.region_value(("function", token[1]), "$owned")):
                 raise _ProofIncomplete("opaque-decorator-call")
             declaration = self.index.node_for_id(token[1])
             parameter = _ProofEffects.name_lambda(declaration)
@@ -8367,6 +8474,28 @@ class _ProofContext:
                 raise _ProofIncomplete("imprecise-decorator-return")
             return _ProofOutcome(current, value)
 
+        def apply_definition(node, decorators, value, current, visits, incoming):
+            operand_holds = current.temporaries
+            current = replace(current, temporaries=operand_holds + (value,))
+            outcome = _ProofOutcome(current, value, visits=visits)
+            for decorator_node, decorator in reversed(tuple(zip(node.decorator_list, decorators))):
+                record(decorator_node, "apply", outcome.state)
+                prefix = visit_then(outcome.visits, visit_event(decorator_node, "apply"))
+                applied = name_call(decorator, outcome.value, outcome.state)
+                current = drop_holds(applied.state, operand_holds,
+                    (applied.value,) if applied.normal else ())
+                outcome = replace(applied, state=replace(current, temporaries=operand_holds + (
+                    (applied.value,) if applied.normal else ())), visits=prefix)
+                self._check_alias_budget(outcome.state, stats)
+                if not outcome.normal:
+                    break
+            current = outcome.state
+            if outcome.normal:
+                current = bind_name(node.name, outcome.value, current)
+                self._check_alias_budget(current, stats)
+            current = drop_holds(current, incoming.temporaries)
+            return _ProofOutcome(current, observation=outcome.observation, visits=outcome.visits)
+
         def definition(node, incoming):
             if node.type_params:
                 raise _ProofIncomplete("unsupported-definition-type-parameters")
@@ -8378,27 +8507,69 @@ class _ProofContext:
             for values, current, visits in frontiers:
                 decorators = values[:len(node.decorator_list)]
                 value, current = make_function(node, values[len(decorators):], current)
-                operand_holds = current.temporaries
-                current = replace(current, temporaries=operand_holds + (value,))
-                outcome = _ProofOutcome(current, value, visits=visits)
-                for decorator_node, decorator in reversed(tuple(zip(node.decorator_list, decorators))):
-                    record(decorator_node, "apply", outcome.state)
-                    prefix = visit_then(outcome.visits, visit_event(decorator_node, "apply"))
-                    applied = name_call(decorator, outcome.value, outcome.state)
-                    current = drop_holds(applied.state, operand_holds,
-                        (applied.value,) if applied.normal else ())
-                    outcome = replace(applied, state=replace(current, temporaries=operand_holds + (
-                        (applied.value,) if applied.normal else ())), visits=prefix)
-                    self._check_alias_budget(outcome.state, stats)
-                    if not outcome.normal:
-                        break
-                current = outcome.state
-                if outcome.normal:
-                    current = bind_name(node.name, outcome.value, current)
-                    self._check_alias_budget(current, stats)
-                current = drop_holds(current, incoming.temporaries)
-                results.append(_ProofOutcome(current, observation=outcome.observation, visits=outcome.visits))
+                results.append(apply_definition(node, decorators, value, current, visits, incoming))
             return bounded(results, node)
+
+        def class_definition(node, incoming):
+            if node.type_params or not all(isinstance(part, ast.Pass) for part in node.body):
+                raise _ProofIncomplete("unsupported-class-body")
+            decorators, abrupt = operands(tuple(node.decorator_list), incoming)
+            results = list(abrupt)
+            for captured, current, visits in decorators:
+                if _ProofEffects.frame_builtin(current, "__build_class__") != _ProofValue(frozenset({("native","__build_class__")})):
+                    raise _ProofIncomplete("class-builder-identity")
+                decorator_holds = current.temporaries
+                body_function, current = make_function(node, (), current)
+                current = replace(current, temporaries=current.temporaries + (body_function,))
+                headers, failures = operands(tuple(node.bases) + tuple(node.keywords), current)
+                results.extend(replace(item, state=drop_holds(item.state, incoming.temporaries),
+                    visits=visit_then(visits, item.visits)) for item in failures)
+                for values, current, header_visits in headers:
+                    bases = expanded_arguments(node.bases, values[:len(node.bases)])
+                    if len(bases) > 1 or any(keyword.arg is not None and (
+                            keyword.arg != "metaclass" or value != _ProofValue(frozenset({("native","type")})))
+                            for keyword,value in zip(node.keywords,values[len(node.bases):])):
+                        raise _ProofIncomplete("unsupported-class-header")
+                    base = _ProofEffects.single(bases[0]) if bases else ("native","object")
+                    if not base or len(base) != 2 or base[0] != "native" or type(base[1]) is not str or (
+                            base[1] != "object" and base[1] not in _ProofEffects._exception_mros):
+                        # Custom base substitution/metaclass preparation and
+                        # post-body type failures need their actual phases.
+                        raise _ProofIncomplete("unsupported-class-base")
+                    base = ("native",_ProofEffects._exception_mros.get(base[1],(base[1],))[0])
+                    combined = visit_then(visits, header_visits)
+                    record(node, "build", current)
+                    combined = visit_then(combined, visit_event(node,"build"))
+                    self._charge(stats, 2 * len(current.regions) + 1)
+                    module = _ProofEffects.region_value(self.index, scope, current, ("globals",0), "__name__")
+                    if module == _ProofValue.absent():
+                        selected = current.region_value(("function",self.index.node_id(node)),"$builtins")
+                        module = _ProofEffects.captured_builtin(self.index,scope,current,selected,"__name__")
+                    if module == _ProofValue.absent():
+                        current = self._implicit_error(node,"NameError",current,stats,
+                            fields=(("name",_ProofValue.literal("__name__")),))
+                        results.append(_ProofOutcome(drop_holds(current,incoming.temporaries),visits=combined))
+                        continue
+                    metadata = _ProofEffects.single(module)
+                    if not metadata or metadata[:2] != ("literal","str") or not _ProofEffects.closed_leaf(metadata):
+                        raise _ProofIncomplete("class-metadata")
+                    if max(3,len(self._class_entry_defaults[node])) > self.limits["names"]:
+                        raise _ProofIncomplete("name-budget")
+                    region = ("class",self.index.node_id(node))
+                    reserve_graph(current)
+                    if region in _ProofEffects.reachable(current)[4] or any(old == region for old,name,value in current.regions):
+                        raise _ProofIncomplete("repeated-class-allocation")
+                    self._charge(stats,3)
+                    current = current.write_region(region,"$owned",_ProofValue.literal(True))
+                    current = current.write_region(region,"$base",_ProofValue(frozenset({base})))
+                    current = current.write_region(region,"$module",module)
+                    value = _ProofValue(frozenset({region}))
+                    self._check_alias_budget(replace(current,temporaries=current.temporaries+(value,)),stats)
+                    current = drop_holds(current,decorator_holds,(value,))
+                    current = prune_graph(replace(current,temporaries=decorator_holds+(value,)))
+                    current = replace(current,temporaries=decorator_holds)
+                    results.append(apply_definition(node,captured,value,current,combined,incoming))
+            return bounded(results,node)
 
         def expression(node, state):
             origin = region_origin(node, state)
@@ -9241,7 +9412,8 @@ class _ProofContext:
                         if not outcome.normal:
                             route(cursor, outcome)
                             continue
-                        matches, error = _ProofEffects.handler_match(outcome.value, saved[2], outcome.state) \
+                        matches, error = _ProofEffects.handler_match(outcome.value, saved[2], outcome.state,
+                            lambda amount: self._charge(stats, amount)) \
                             if handler.type is not None else (True, None)
                         if error is not None:
                             current = self._implicit_error(handler, error, outcome.state, stats)
@@ -9531,10 +9703,16 @@ class _ProofContext:
                     statement_outcomes = definition(node, state)
                 elif isinstance(node, ast.ClassDef):
                     mark_interference()
-                    self._charge(stats)
-                    self._charge(stats)
-                    value = _ProofEffects.empty_class(self.index, scope, node, state)
-                    state = bind_name(node.name, value, state)
+                    if not node.bases and not node.keywords and not node.decorator_list:
+                        # Preserve the existing empty-instance contract until
+                        # owned instances retain their new nominal class graph.
+                        self._charge(stats,2)
+                        record(node,"build",state)
+                        value = _ProofEffects.empty_class(self.index, scope, node, state)
+                        state = bind_name(node.name, value, state)
+                        statement_outcomes = (_ProofOutcome(state,visits=visit_event(node,"build")),)
+                    else:
+                        statement_outcomes = class_definition(node,state)
                 elif isinstance(node, (ast.Assign, ast.Expr)):
                     statement_outcomes = expression(node.value, state)
                     if isinstance(node, ast.Assign):
@@ -27766,6 +27944,240 @@ class ProofFlowTests(unittest.TestCase):
         context = _ProofContext(source, **kwargs)
         func = context.tree.body[0]
         return context, func, context.solve(func, entry=entry)
+
+    def _class_header_solve(self, body, **kwargs):
+        seed = _ProofState().bind(0,"__name__",_ProofValue.literal("fixture"))
+        return self._solve(body,entry=(seed,),**kwargs)
+
+    def test_class_header_base_walrus_binds_the_enclosing_scope(self):
+        context,func,snapshot = self._class_header_solve("class C((present:=object)):\n    pass\ndel present\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertTrue(snapshot.must_execute(func.body[-1]))
+        self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func),"present"),_ProofValue.unbound())
+
+    def test_class_header_bare_pass_path_also_publishes_actual_builder_invocation(self):
+        context,func,snapshot = self._class_header_solve("class C:\n    pass\nmarker=1")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertTrue(snapshot.must_execute((func.body[0],"build")))
+        self.assertFalse(snapshot.target_unreachable((func.body[0],"build")))
+
+    def test_class_header_first_error_skips_later_stores_and_keeps_the_old_binding(self):
+        context,func,snapshot = self._class_header_solve("C=int\ntry:\n    class C(missing,(later:=object)):\n        pass\nexcept NameError:\n    pass\nmarker=C")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        declaration = func.body[1].body[0]
+        self.assertTrue(snapshot.target_unreachable(declaration.bases[1]))
+        self.assertTrue(snapshot.target_unreachable((declaration,"after")))
+        self.assertTrue(snapshot.target_unreachable((declaration,"build")))
+        marker = func.body[-1]
+        self.assertEqual(snapshot.value_at(marker,"C",snapshot.states_at(marker)[0]),_ProofValue(frozenset({("native","int")})))
+
+    def test_class_header_native_parent_does_not_match_its_new_subclass_or_alias(self):
+        context,func,snapshot = self._class_header_solve("class B(TypeError):\n    pass\nsaved=B\ntry:\n    int(None)\nexcept saved:\n    marker=0\nexcept TypeError:\n    marker=1\nresult=marker")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        marker = func.body[-1]
+        self.assertEqual(snapshot.value_at(marker,"marker",snapshot.states_at(marker)[0]),_ProofValue.literal(1))
+        state = snapshot.states_at(marker)[0]
+        owner = context.index.node_id(func)
+        self.assertEqual(state.lookup(owner,"B"),state.lookup(owner,"saved"))
+        self.assertNotEqual(state.lookup(owner,"B"),_ProofValue(frozenset({("native","TypeError")})))
+
+    def test_class_header_unknown_exception_cannot_be_excluded_from_a_nominal_child(self):
+        context = _ProofContext("class B(TypeError):\n    pass\nmarker=1")
+        site = context.index.node_id(context.tree.body[0])
+        child = _ProofValue(frozenset({("class",site)}))
+        state = _ProofState(epoch=context._epoch).bind(0,"B",child)
+        state = state.write_region(("class",site),"$owned",_ProofValue.literal(True))
+        state = state.write_region(("class",site),"$base",_ProofValue(frozenset({("native","TypeError")})))
+        state = state.write_region(("class",site),"$module",_ProofValue.literal("fixture"))
+        unknown = ("unknown-exception",site,"trusted-print")
+        self.assertEqual(_ProofEffects.handler_match(child,("native-exception","TypeError",site),state),(False,None))
+        for value in (child,_ProofValue(frozenset({("exception-types",(_ProofEffects.single(child),))}))):
+            with self.assertRaises(_ProofIncomplete):
+                _ProofEffects.handler_match(value,unknown,state)
+
+    def test_class_header_o7_suppress_classinfo_preserves_the_second_candidate(self):
+        for candidate,want in (("NameError",True),("ValueError",False)):
+            context,func,snapshot = self._class_header_solve("import contextlib\nclass B(TypeError):\n    pass\nsaved=B\nwith contextlib.suppress(saved,"+candidate+"):\n    del missing\nmarker=int")
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            self.assertEqual(snapshot.exits[0].pending.kind,"normal" if want else "raise")
+            self.assertEqual(bool(snapshot.must_execute(func.body[-1])),want)
+            self.assertEqual(bool(snapshot.target_unreachable(func.body[-1])),not want)
+
+    def test_class_header_plain_class_is_invalid_except_but_valid_suppress_classinfo(self):
+        context,func,snapshot = self._class_header_solve("class B(object):\n    pass\ntry:\n    try:\n        raise ValueError\n    except B:\n        marker=0\nexcept TypeError:\n    marker=1\nresult=marker")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.value_at(func.body[-1],"marker",snapshot.states_at(func.body[-1])[0]),_ProofValue.literal(1))
+        context,func,snapshot = self._class_header_solve("import contextlib\nclass B(object):\n    pass\nwith contextlib.suppress(B):\n    raise ValueError\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.error_kind,"ValueError")
+
+    def test_class_header_decorators_precede_bases_and_apply_after_construction(self):
+        context,func,snapshot = self._class_header_solve("@(deco:=lambda f:f)\nclass C((base:=object)):\n    pass\nmarker=C")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        declaration = func.body[0]
+        owner = context.index.node_id(func)
+        self.assertFalse(snapshot.states_at(declaration.bases[0])[0].lookup(owner,"deco").is_unbound)
+        state = snapshot.states_at(declaration.decorator_list[0],"apply")[0]
+        self.assertEqual(state.lookup(owner,"base"),_ProofValue(frozenset({("native","object")})))
+        self.assertTrue(snapshot.must_execute((declaration,"build")))
+
+    def test_class_header_body_mapping_is_captured_before_the_base_rebinds_globals(self):
+        for initial,want in (("",True),("__builtins__={}\n",False)):
+            context = _ProofContext(initial+"class C((__builtins__:=object)):\n    pass\nmarker=1\n")
+            seed = _ProofState().bind(0,"__name__",_ProofValue.absent()).write_region(("builtins",0),"__name__",_ProofValue.literal("captured"))
+            snapshot = context.solve(entry=(seed,))
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            self.assertEqual(snapshot.exits[0].pending.kind,"normal" if want else "raise")
+            if not want:
+                self.assertEqual(snapshot.exits[0].pending.error_kind,"NameError")
+                self.assertTrue(snapshot.target_unreachable(context.tree.body[-1]))
+
+    def test_class_header_unknown_metadata_does_not_become_a_safe_pass_body(self):
+        context,func,snapshot = self._solve("class C(object):\n    pass\nmarker=int")
+        self.assertFalse(snapshot.complete)
+        self.assertFalse(snapshot.must_execute(func.body[-1]))
+
+    def test_class_header_module_metadata_requires_a_closed_exact_string(self):
+        for declaration in ("class C:\n    pass", "class C(object):\n    pass",
+                "class C(((__name__:='fixture'),object)[1]):\n    pass"):
+            for token in (("literal","str"),("literal","str",1),("literal","str","x",0),("not-a-value",),("literal","str","fixture")):
+                with self.subTest(declaration=declaration,token=token):
+                    context = _ProofContext("def f():\n    global __name__\n"+"".join("    "+line+"\n" for line in (declaration+"\nmarker=int").splitlines()))
+                    func = context.tree.body[0]
+                    seed = _ProofState().bind(0,"__name__",_ProofValue(frozenset({token})))
+                    result = context.solve(func,entry=(seed,))
+                    self.assertEqual(result.complete,token==("literal","str","fixture"),result.reasons)
+                    if not result.complete:
+                        self.assertFalse(result.must_execute(func.body[-1]))
+
+    def test_class_header_noncanonical_owned_marker_cannot_reuse_a_warm_entry_cache(self):
+        source = "def f():\n    class B(TypeError):\n        pass\ndef g(holder):\n    marker=int\n"
+        for warm in (False,True):
+            for raw in (1,1.0):
+                with self.subTest(warm=warm,raw_type=type(raw).__name__):
+                    context = _ProofContext(source)
+                    func,other = context.tree.body
+                    region = ("class",context.index.node_id(func.body[0]))
+                    child = _ProofValue(frozenset({region}))
+                    state = _ProofState(epoch=context._epoch).bind(context.index.node_id(other),"holder",child)
+                    state = state.write_region(region,"$owned",_ProofValue.literal(True))
+                    state = state.write_region(region,"$base",_ProofValue(frozenset({("native","TypeError")})))
+                    state = state.write_region(region,"$module",_ProofValue.literal("fixture"))
+                    if warm:
+                        accepted = context.solve(other,entry=(state,))
+                        self.assertTrue(accepted.complete,accepted.reasons)
+                    invalid = state.write_region(region,"$owned",_ProofValue(frozenset({("literal","bool",raw)})))
+                    result = context.solve(other,entry=(invalid,))
+                    self.assertFalse(result.complete)
+                    self.assertFalse(result.must_execute(other.body[0]))
+                    if warm:
+                        self.assertIsNot(result,accepted)
+
+    def test_class_header_owned_sequence_children_are_validated_before_traversal(self):
+        for position,child in enumerate((frozenset({("literal","int",1)}),0,frozenset({()}),frozenset({1}),frozenset())):
+            with self.subTest(shape=position):
+                context = _ProofContext("seed=(1,)\ndef g(holder):\n    pass\nclass B(object):\n    pass\n")
+                sequence,other,declaration = context.tree.body
+                site = context.index.node_id(declaration)
+                value = _ProofValue(frozenset({("sequence","tuple",context.index.node_id(sequence.value),(child,),2,1)}))
+                state = _ProofState(epoch=context._epoch).bind(context.index.node_id(other),"holder",_ProofValue(frozenset({("function",site)})))
+                state = state.write_region(("function",site),"$owned",_ProofValue.literal(True))
+                state = state.write_region(("function",site),"$builtins",_ProofEffects.namespace("mapping",("builtins",0)))
+                state = state.write_region(("function",site),"$module",value)
+                result = context.solve(other,entry=(state,))
+                self.assertEqual(result.complete,position==0,result.reasons)
+                if position:
+                    self.assertFalse(result.must_execute(other.body[0]))
+
+    def test_class_header_nominal_class_does_not_get_native_only_operations(self):
+        for tail in ("B|TypeError", "B()", "raise B", "ExceptionGroup('x',[TypeError()]).split(B)",
+                "try:\n    raise TypeError\nexcept* B:\n    pass"):
+            context,func,snapshot = self._class_header_solve("class B(TypeError):\n    pass\n"+tail+"\nmarker=int")
+            self.assertFalse(snapshot.complete,tail)
+            # This must pass class creation, then refuse the unmodeled operation.
+            self.assertTrue(snapshot.states_at(func.body[1]),snapshot.reasons)
+            self.assertFalse(snapshot.target_unreachable(func.body[-1]))
+
+    def test_class_header_owned_graph_roundtrips_and_rejects_forged_metadata(self):
+        source = "def f():\n    class B(TypeError):\n        pass\n    marker=1\ndef g(holder):\n    try:\n        int(None)\n    except holder:\n        marker=0\n    except TypeError:\n        marker=1\n    result=marker\n"
+        context = _ProofContext(source)
+        func,other = context.tree.body
+        initial = _ProofState().bind(0,"__name__",_ProofValue.literal("fixture"))
+        first = context.solve(func,entry=(initial,))
+        self.assertTrue(first.complete,first.reasons)
+        state = first.states_at(func.body[-1])[0]
+        owner = context.index.node_id(func)
+        captured = state.lookup(owner,"B")
+        entry = state.bind(context.index.node_id(other),"holder",captured)
+        second = context.solve(other,entry=(entry,))
+        self.assertTrue(second.complete,second.reasons)
+        self.assertEqual(second.exits[0].lookup(context.index.node_id(other),"marker"),_ProofValue.literal(1))
+        region = ("class",context.index.node_id(func.body[0]))
+        for invalid in (entry.write_region(region,"extra",_ProofValue.literal(0)),
+                entry.write_region(region,"$owned",_ProofValue.literal(False)),
+                replace(entry,regions=tuple(row for row in entry.regions if row[:2]!=(region,"$base"))),
+                entry.bind(context.index.node_id(other),"view",_ProofEffects.namespace("mapping",region)),
+                state.bind(owner,"B",_ProofValue.unbound())):
+            result = context.solve(other,entry=(invalid,))
+            self.assertFalse(result.complete)
+            self.assertFalse(result.must_execute(other.body[-1]))
+
+    def test_class_header_peak_and_work_budget_include_the_body_function_and_new_class(self):
+        # Body function +three rows +mapping; new class +three rows =9.
+        for aliases,want in ((8,False),(9,True),(10,True)):
+            context,func,snapshot = self._class_header_solve("class B(object):\n    pass\nmarker=1",limits={"aliases":aliases})
+            self.assertEqual(snapshot.complete,want,snapshot.reasons)
+        context,func,snapshot = self._class_header_solve("class B(object):\n    pass\nmarker=1")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        cost = snapshot.stats["steps"]
+        for budget,want in ((cost-1,False),(cost,True),(cost+1,True)):
+            context,func,result = self._class_header_solve("class B(object):\n    pass\nmarker=1",limits={"steps":budget})
+            self.assertEqual(result.complete,want,result.reasons)
+
+    def test_class_header_repeated_live_allocation_cannot_retarget_old_aliases(self):
+        context,func,first = self._class_header_solve("class B(TypeError):\n    pass\nmarker=1")
+        self.assertTrue(first.complete,first.reasons)
+        state = first.states_at(func.body[-1])[0]
+        owner = context.index.node_id(func)
+        entry = state.bind(owner,"saved",state.lookup(owner,"B"))
+        second = context.solve(func,entry=(entry,))
+        self.assertFalse(second.complete)
+        self.assertIn("repeated-class-allocation",second.reasons)
+
+    def test_class_header_malformed_identity_is_rejected_before_canonical_order(self):
+        context = _ProofContext("def f(holder):\n    pass\n",limits={"steps":100000})
+        func = context.tree.body[0]
+        dag = ("bad",)
+        for unused in range(10):
+            dag = (dag,dag)
+        entry = _ProofState(epoch=context._epoch).bind(context.index.node_id(func),"holder",_ProofValue(frozenset({("class",dag)})))
+        ordered = []
+        original = _ProofState.order_key
+        def guarded(state):
+            ordered.append(1)
+            return original(state)
+        with mock.patch.object(_ProofState,"order_key",guarded):
+            result = context.solve(func,entry=(entry,))
+        self.assertFalse(result.complete)
+        self.assertFalse(ordered)
+
+    def test_class_header_reverse_decorator_application_keeps_the_returned_identity(self):
+        context,func,snapshot = self._class_header_solve("@lambda f:NameError\n@lambda f:f\nclass B(TypeError):\n    pass\nmarker=B")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.value_at(func.body[-1],"B",snapshot.states_at(func.body[-1])[0]),_ProofValue(frozenset({("native","NameError")})))
+
+    def test_class_header_body_function_retains_its_original_module_through_bases(self):
+        source = "def f():\n    global __name__\n    class C(((__name__:='fixture'),object)[1]):\n        pass\n    marker=int\n"
+        context = _ProofContext(source)
+        func = context.tree.body[0]
+        seed = _ProofState().bind(0,"__name__",_ProofValue(frozenset({("opaque","initial-module")})))
+        snapshot = context.solve(func,entry=(seed,))
+        self.assertFalse(snapshot.complete)
+        self.assertIn("opaque-release",snapshot.reasons)
+        # The captured old object survives the base assignment until builder
+        # consumption; refusing the earlier store would model the wrong lifetime.
+        self.assertTrue(snapshot.states_at(func.body[1],"build"))
+        self.assertFalse(snapshot.must_execute(func.body[-1]))
 
     def test_prologue_named_expression_stores_only_after_a_normal_rhs(self):
         for rhs,want in (("int('7')",7),("int('bad')",1)):
