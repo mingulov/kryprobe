@@ -4530,6 +4530,20 @@ class _ProofCompletion:
         return cls(kind, error, target, None if value is None else _ProofValue(*value))
 
 
+def _proof_group_key(key):
+    return type(key) is tuple and len(key) == 3 and type(key[0]) is str and type(key[1]) is str \
+        and key[0] in ("split", "subgroup", "project") \
+        and key[1] in ("match", "rest") and (key[0] == "split" or key[1] == "match") \
+        and type(key[2]) is tuple and len(key[2]) <= 128 \
+        and all(type(index) is int and 0 <= index < 100_000 for index in key[2])
+
+
+def _proof_owned_payload(value):
+    return type(value) is tuple and len(value) in (3, 4) and type(value[0]) is str and value[0] == "native-exception" \
+        and type(value[1]) is str and type(value[2]) is int and value[2] >= 0 \
+        and (len(value) == 3 or (value[1] in ("ExceptionGroup", "BaseExceptionGroup") and _proof_group_key(value[3])))
+
+
 @dataclass(frozen=True)
 class _ProofCollectionObject:
     """Finite owned identity; slots may reference other objects, including self."""
@@ -4539,11 +4553,15 @@ class _ProofCollectionObject:
     depth: int = 1
 
     def __post_init__(self):
-        if type(self.identity) is not tuple or len(self.identity) != 4 \
+        if type(self.identity) is not tuple or len(self.identity) not in (4, 5) \
+                or any(type(self.identity[position]) is not str for position in (0, 1, 3)) \
                 or self.identity[0] != "collection" or self.identity[1] not in ("list", "tuple") \
                 or type(self.identity[2]) is not int or self.identity[2] < 0 \
                 or self.identity[3] not in ("literal", "args", "implicit-args", "captured", "empty", "slice", "args-store",
-                                           "legacy-captured", "legacy-args") \
+                                           "legacy-captured", "legacy-args", "derived-input", "derived-args",
+                                           "derived-captured", "split-result") \
+                or (len(self.identity) == 5) != self.identity[3].startswith("derived-") \
+                or (len(self.identity) == 5 and not _proof_group_key(self.identity[4])) \
                 or type(self.items) is not tuple or any(type(item) is not _ProofValue for item in self.items) \
                 or type(self.depth) is not int or self.depth < 1:
             raise TypeError("invalid immutable collection object")
@@ -4569,16 +4587,14 @@ class _ProofExceptionObject:
     origin: str = "constructor"
 
     def __post_init__(self):
-        def payload(value):
-            return type(value) is tuple and len(value) == 3 and value[0] == "native-exception" \
-                and type(value[1]) is str and type(value[2]) is int and value[2] >= 0
-        if type(self.origin) is not str or self.origin not in ("constructor", "implicit") \
-                or not payload(self.payload) or type(self.arguments) is not tuple \
+        if type(self.origin) is not str or self.origin not in ("constructor", "implicit", "derived") \
+                or not _proof_owned_payload(self.payload) or (self.origin == "derived") != (len(self.payload) == 4) \
+                or type(self.arguments) is not tuple \
                 or any(type(value) is not _ProofValue for value in self.arguments) \
                 or any(type(items) is not tuple or any(type(item) is not tuple or len(item) != 2
                     or type(item[0]) is not str or type(item[1]) is not _ProofValue for item in items)
                        for items in (self.keywords, self.fields)) \
-                or type(self.children) is not tuple or any(not payload(item) for item in self.children) \
+                or type(self.children) is not tuple or any(not _proof_owned_payload(item) for item in self.children) \
                 or any(value is not None and type(value) is not _ProofValue
                        for value in (self.message, self.args_value, self.captured_value)):
             raise TypeError("invalid immutable exception object")
@@ -4755,11 +4771,11 @@ class _ProofState:
             + [value for region, name, value in self.regions] + list(self.temporaries)
         if self.pending.value is not None:
             values.append(self.pending.value)
-        count = len(self.borrowed_exceptions) + sum(atom[0] in ("namespace", "exception", "sequence", "collection")
+        count = len(self.borrowed_exceptions) + sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method")
                                                  for value in values for atom in value.atoms)
         for frame in self.continuation:
             if frame and frame[0] == "finally" and frame[2][3] is not None:
-                count += sum(atom[0] in ("namespace", "exception", "sequence", "collection") for atom in frame[2][3][0])
+                count += sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method") for atom in frame[2][3][0])
                 values.append(_ProofValue(*frame[2][3]))
         error_roots = [self.pending.error, self.active, self.managers]
         for frame in self.continuation:
@@ -4777,6 +4793,12 @@ class _ProofState:
                 error_roots.extend(part)
         pending = [value.atoms for value in values]
         pending.extend(value.atoms for item in self.exception_objects for value in item.values())
+        # A method descriptor captures its receiver. No method-object identity
+        # is inferred from this structural value; charge its node/edge at
+        # every stored occurrence (copies conservatively over-account).
+        method_values = values + [value for item in self.exception_objects for value in item.values()] \
+            + [value for item in self.collection_objects for value in item.items]
+        count += 2 * sum(atom[0] == "exception-method" for value in method_values for atom in value.atoms)
         collections = set()
         while pending:
             atoms = pending.pop()
@@ -4826,6 +4848,7 @@ class _ProofEffects:
     """Pure symbolic lookup/effect models, independent of flow or taint queries."""
 
     _builtin_names = frozenset(vars(builtins))
+    _builtin_types = frozenset(name for name, value in vars(builtins).items() if isinstance(value, type))
     # Snapshot only genuine interpreter-owned exception metadata. This never
     # resolves inspected attributes, constructs exceptions or invokes a model.
     _exception_mros = MappingProxyType({name: tuple(base.__name__ for base in value.__mro__)
@@ -4859,8 +4882,9 @@ class _ProofEffects:
     def exception_name(cls, error):
         if type(error) is str and error in cls._exception_mros:
             return cls._exception_mros[error][0]
-        if type(error) is tuple and len(error) == 3 and error[0] in ("native-exception", "borrowed-exception") \
-                and error[1] in cls._exception_mros and type(error[2]) is int:
+        if type(error) is tuple and ((len(error) in (3, 4) and _proof_owned_payload(error)) or (
+                len(error) == 3 and error[0] == "borrowed-exception" and type(error[2]) is int)) \
+                and error[1] in cls._exception_mros:
             return cls._exception_mros[error[1]][0]
         return None
 
@@ -5169,12 +5193,16 @@ class _ProofEffects:
             return False
         token = cls.single(value)
         return cls.closed_value(value) or (token[0] in ("namespace", "opaque")) \
+            or (token[0] == "exception-method" and len(token) == 3 and token[2] in ("split", "subgroup")
+                and state is not None and state.exception_object(token[1]) is not None) \
             or (token[0] == "collection" and state is not None and state.collection_object(token) is not None)
 
     @classmethod
-    def allocate_collection(cls, state, kind, site, items, role="literal"):
+    def allocate_collection(cls, state, kind, site, items, role="literal", derivation=None):
         identity = ("collection", kind, site, role) if kind != "tuple" or items \
             else ("collection", "tuple", 0, "empty")
+        if derivation is not None:
+            identity += (derivation,)
         if identity[3] != "empty" and identity in cls.reachable(state, items)[1]:
             raise _ProofIncomplete("repeated-collection-allocation")
         depth = 1 + max((item.depth for value in items
@@ -5396,6 +5424,126 @@ class _ProofEffects:
         if token and token[0] in ("literal", "singleton") and token[:2] != ("literal", "float"):
             return None, "TypeError"
         raise _ProofIncomplete("unsupported-int-conversion")
+
+    @classmethod
+    def group_matcher(cls, value, state, version, charge):
+        token = cls.single(value)
+        info = cls.sequence_info(value, state)
+        members = info[0] if info is not None and token[1] == "tuple" else (value,)
+        charge(1 + len(members))
+        result = []
+        for member in members:
+            atom = cls.single(member)
+            if atom and atom[0] == "native" and atom[1] in cls._exception_mros:
+                result.append(cls._exception_mros[atom[1]][0])
+                continue
+            if atom is None or atom[0] in ("opaque", "exception-types"):
+                raise _ProofIncomplete("unknown-group-matcher")
+            if info is None and (atom[0] in ("function", "const-callable", "exception-method") or (
+                    atom[0] == "native" and atom[1] not in cls._builtin_types and version[:2] == (3, 14))):
+                raise _ProofIncomplete("unsupported-group-predicate")
+            return None, "TypeError"
+        return ("types", tuple(result)), None
+
+    @classmethod
+    def derive_subset(cls, state, original, children, site, key, charge, limits):
+        if not children:
+            return None, state
+        item = state.exception_object(original)
+        if item is None or not item.children or item.message is None or not _proof_group_key(key):
+            raise _ProofIncomplete("unowned-group-derivation")
+        charge(1 + len(children))
+        parts = tuple(state.exception_object(child) for child in children)
+        if any(part is None for part in parts):
+            raise _ProofIncomplete("unowned-group-member")
+        kind = "ExceptionGroup" if all("Exception" in cls._exception_mros[part.payload[1]] for part in parts) \
+            else "BaseExceptionGroup"
+        payload = ("native-exception", kind, site, key)
+        values = tuple(_ProofValue(frozenset({("exception", child)})) for child in children)
+        charge(4 * cls.exception_work(state, values))
+        if payload in cls.live_exception_ids(state, values):
+            raise _ProofIncomplete("repeated-group-derivation")
+        # Reserve all new nodes/ordered edges before allocating their records.
+        # args owns a new input LIST, not the original mutable constructor input.
+        if state.alias_count() + 9 + 2 * len(children) + len(item.fields) > limits["aliases"]:
+            raise _ProofIncomplete("alias-budget")
+        input_value, state = cls.allocate_collection(state, "list", site, values, "derived-input", key)
+        charge(4 * cls.exception_work(state, (input_value,)))
+        arguments = (item.message, input_value)
+        args_value, state = cls.allocate_collection(state, "tuple", site, arguments, "derived-args", key)
+        charge(4 * cls.exception_work(state, values))
+        captured, state = cls.allocate_collection(state, "tuple", site, values, "derived-captured", key)
+        derived = _ProofExceptionObject(payload, arguments, (), item.fields, children, item.message,
+                                        args_value, captured, "derived")
+        objects = tuple(old for old in state.exception_objects if old.payload != payload) + (derived,)
+        charge((len(objects) + len(state.exception_metadata) + 1) * (1 + len(objects).bit_length()))
+        blocks = []
+        for tag, members in state.exception_metadata:
+            members = members - {payload}
+            if original in members:
+                members |= {payload}
+            if members:
+                blocks.append((tag, members))
+        state = replace(state, exception_objects=tuple(sorted(objects, key=lambda old: old.payload)),
+            exception_metadata=tuple(sorted(blocks, key=lambda block: (block[0], tuple(sorted(block[1]))))))
+        return payload, state
+
+    @classmethod
+    def split_owned(cls, state, root, matcher, site, operation, charge, limits, want_rest=True):
+        """Occurrence walk, not object memoization; no inspected callbacks.
+
+        A frame holds partial match/rest children until their parent owns them.
+        New objects stay in the bounded table throughout this operation. Only
+        the ordinary evaluator can drop holds/prune after publishing results.
+        """
+        if operation not in ("split", "subgroup", "project") or matcher[0] not in ("types", "leaves"):
+            raise _ProofIncomplete("unsupported-group-split")
+        frames = [[root, (), 0, None, None]]
+        while frames:
+            charge(1)
+            payload, path, position, matched, residual = frames[-1]
+            item = state.exception_object(payload)
+            if item is None:
+                raise _ProofIncomplete("unowned-group-member")
+            if matched is None:
+                if matcher[0] == "leaves":
+                    charge(1)
+                    match = not item.children and payload in matcher[1]
+                else:
+                    charge(1 + len(matcher[1]))
+                    match = any(name in cls._exception_mros[payload[1]] for name in matcher[1])
+                if match:
+                    result = payload, None
+                elif not item.children:
+                    result = None, payload if want_rest else None
+                else:
+                    frames[-1][3:5] = [[], []]
+                    continue
+            elif position < len(item.children):
+                if len(path) >= limits["depth"]:
+                    raise _ProofIncomplete("group-depth-budget")
+                charge(1 + len(path))
+                frames[-1][2] += 1
+                frames.append([item.children[position], path + (position,), 0, None, None])
+                continue
+            else:
+                charge(len(matched) + len(residual))
+                left, state = cls.derive_subset(state, payload, tuple(matched), site,
+                    (operation, "match", path), charge, limits)
+                right = None
+                if want_rest:
+                    right, state = cls.derive_subset(state, payload, tuple(residual), site,
+                        (operation, "rest", path), charge, limits)
+                result = left, right
+            frames.pop()
+            if not frames:
+                return result, state
+            charge(2)
+            if result[0] is not None:
+                frames[-1][3].append(result[0])
+            if result[1] is not None:
+                frames[-1][4].append(result[1])
+        raise _ProofIncomplete("missing-group-split-result")
 
     @classmethod
     def handler_match(cls, value, error, state=None):
@@ -5723,6 +5871,8 @@ class _ProofEffects:
                 return item.captured_value, None
             if key == "message" and item.message is not None:
                 return item.message, None
+            if key in ("split", "subgroup") and item.children:
+                return _ProofValue(frozenset({("exception-method", item.payload, key)})), None
             kind = cls.exception_field_kind(item.payload[1], key, index.semantic_key)
             if kind is not None:
                 fields = dict(item.keywords + item.fields)
@@ -5918,7 +6068,7 @@ class _ProofEffects:
                     return False
                 order = {item.identity: position for position, item in enumerate(state.collection_objects)}
                 later = left if order[left] > order[right] else right
-                if later[3] in ("slice", "captured", "args-store"):
+                if later[3] in ("slice", "captured", "args-store", "derived-args", "derived-captured", "split-result"):
                     return False  # Proven fresh AFTER the other live reference.
             elif left[0] == right[0] in ("exception", "namespace", "singleton"):
                 return left == right
@@ -6397,6 +6547,8 @@ class _ProofContext:
         def error(payload):
             if type(payload) is str:
                 return True  # A legacy kind hypothesis has no owned metadata.
+            if _proof_owned_payload(payload):
+                return _ProofEffects.exception_name(payload) is not None
             if type(payload) is not tuple or len(payload) != 3 or type(payload[0]) is not str:
                 return False
             if payload[0] in ("native-exception", "borrowed-exception"):
@@ -6529,6 +6681,10 @@ class _ProofContext:
                             errors.append(frame[2][1])
                     errors.extend(frame[1] for frame in active if len(frame) == 2 and frame[0] == "error")
                     for payload in errors:
+                        if type(payload) is tuple and payload[0] == "native-exception" \
+                                and state.exception_object(payload) is None:
+                            reasons.append("unowned-exception-entry")
+                            return snapshot()
                         if type(payload) is tuple and payload[0] == "borrowed-exception" \
                                 and payload not in state.borrowed_exceptions:
                             reasons.append("unregistered-borrowed-entry")
@@ -6557,6 +6713,13 @@ class _ProofContext:
                             and allocation.attr == "args" and isinstance(allocation.ctx, ast.Store)
                     elif identity[3] == "implicit-args":
                         valid = identity[1] == "tuple" and bool(self._implicit_error_kinds(allocation))
+                    elif identity[3].startswith("derived-"):
+                        valid = len(identity) == 5 and isinstance(allocation, (ast.Call, ast.TryStar)) \
+                            and _proof_group_key(identity[4]) \
+                            and identity[1] == ("list" if identity[3] == "derived-input" else "tuple") \
+                            and len(identity[4][2]) <= self.limits["depth"]
+                    elif identity[3] == "split-result":
+                        valid = isinstance(allocation, ast.Call) and identity[1] == "tuple" and len(item.items) == 2
                     else:
                         valid = identity[1] == "tuple" and (isinstance(allocation, (ast.Call, ast.Raise))
                             or (isinstance(parent, ast.Raise) and parent.cause is allocation))
@@ -6573,9 +6736,11 @@ class _ProofContext:
                         parent = self.index.parent(allocation)
                     except (IndexError, KeyError):
                         allocation = parent = None
-                    origin = (name in self._implicit_error_kinds(allocation)
-                              if item.origin == "implicit" else isinstance(allocation, (ast.Call, ast.Raise)) or (
-                                  isinstance(parent, ast.Raise) and parent.cause is allocation))
+                    origin = (name in self._implicit_error_kinds(allocation) if item.origin == "implicit" else (
+                        isinstance(allocation, (ast.Call, ast.TryStar)) and _proof_group_key(item.payload[3])
+                        and len(item.payload[3][2]) <= self.limits["depth"]) if item.origin == "derived" else (
+                            isinstance(allocation, (ast.Call, ast.Raise)) or (
+                                isinstance(parent, ast.Raise) and parent.cause is allocation)))
                     grouped = name in ("ExceptionGroup", "BaseExceptionGroup")
                     if not origin or name is None or (bool(item.children) != grouped) \
                             or (grouped and item.message is None) or (not grouped and item.message is not None) \
@@ -6634,6 +6799,10 @@ class _ProofContext:
                         reasons.append("unsupported-composite-entry")
                         return snapshot()
                     for atom in atoms:
+                        if atom[0] == "exception-method" and (len(atom) != 3 or atom[2] not in ("split", "subgroup")
+                                or (receiver := state.exception_object(atom[1])) is None or not receiver.children):
+                            reasons.append("unowned-group-method-entry")
+                            return snapshot()
                         if atom[0] == "collection" and state.collection_object(atom) is None:
                             reasons.append("unowned-collection-entry")
                             return snapshot()
@@ -6908,6 +7077,27 @@ class _ProofContext:
                         _ProofOutcome(state, observation=("may-diverge", site, "trusted-print")))
             if token in (("native", "exec"), ("native", "eval")):
                 result, state = self._dynamic_call(node, token[1], scope, state, stats)
+            elif token and token[0] == "exception-method":
+                item = state.exception_object(token[1])
+                if item is None or not item.children or token[2] not in ("split", "subgroup"):
+                    raise _ProofIncomplete("unowned-group-method")
+                if len(arguments) != 1 or keywords:
+                    error = "TypeError"
+                else:
+                    matcher, error = _ProofEffects.group_matcher(arguments[0], state, self._native_profile[0],
+                        lambda amount: self._charge(stats, amount))
+                    if error is None:
+                        (matched, rest), state = _ProofEffects.split_owned(state, item.payload, matcher,
+                            self.index.node_id(node), token[2], lambda amount: self._charge(stats, amount),
+                            self.limits, want_rest=token[2] == "split")
+                        def value(payload):
+                            return _ProofValue.literal(None) if payload is None else _ProofValue(frozenset({("exception", payload)}))
+                        result = value(matched)
+                        if token[2] == "split":
+                            reserve_graph(state, (result, value(rest)))
+                            result, state = _ProofEffects.allocate_collection(state, "tuple", self.index.node_id(node),
+                                (result, value(rest)), "split-result")
+                        self._check_alias_budget(state, stats)
             elif token and token[0] == "const-callable":
                 result, error = (None, "TypeError") if arguments or keywords \
                     else (_ProofValue.literal(token[2]), None)
@@ -25845,6 +26035,233 @@ class ProofFlowTests(unittest.TestCase):
         context = _ProofContext(source, **kwargs)
         func = context.tree.body[0]
         return context, func, context.solve(func, entry=entry)
+
+    def test_group_direct_class_match_reuses_root_and_split_returns_owned_pair(self):
+        context, func, snapshot = self._solve("g=ExceptionGroup('g',[ValueError()])\n"
+            "m=g.subgroup(Exception)\npair=g.split(ExceptionGroup)\n"
+            "same=m is g\nfirst=pair[0] is g\nempty=pair[1] is None\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        for name in ("same","first","empty"):
+            self.assertEqual(state.lookup(context.index.node_id(func),name),_ProofValue.literal(True))
+        self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_group_recursive_split_preserves_leaf_aliases_but_not_derived_occurrence_aliases(self):
+        context, func, snapshot = self._solve("v=ValueError()\nt=TypeError()\nh=ExceptionGroup('h',[t,v])\n"
+            "g=ExceptionGroup('g',[h,h])\nm=g.subgroup(ValueError)\n"
+            "a=m.exceptions[0]\nb=m.exceptions[1]\ndistinct=a is not b\n"
+            "left=a.exceptions[0] is v\nright=b.exceptions[0] is v\n"
+            "m.args[1][:]=[]\nkept=m.exceptions[1]\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        for name in ("distinct","left","right"):
+            self.assertEqual(state.lookup(owner,name),_ProofValue.literal(True))
+        matched = state.exception_object(_ProofEffects.single(state.lookup(owner,"m"))[1])
+        self.assertEqual(len(matched.children),2)
+        self.assertNotEqual(*matched.children)
+        self.assertEqual(_ProofEffects.sequence_info(matched.arguments[1],state)[0],())
+        self.assertEqual(state.lookup(owner,"kept"),state.lookup(owner,"b"))
+
+    def test_group_empty_matcher_derives_rest_and_copies_raised_metadata(self):
+        context, func, snapshot = self._solve("v=ValueError()\ng=ExceptionGroup('g',[v])\n"
+            "try:\n    raise g\nexcept ExceptionGroup:\n    pair=g.split(())\n    m=g.subgroup(ValueError)\n"
+            "none=pair[0] is None\nfresh=pair[1] is not g\nleaf=pair[1].exceptions[0] is v\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        for name in ("none","fresh","leaf"):
+            self.assertEqual(state.lookup(owner,name),_ProofValue.literal(True))
+        g = _ProofEffects.single(state.lookup(owner,"g"))[1]
+        m = _ProofEffects.single(state.lookup(owner,"m"))[1]
+        self.assertTrue(state.same_exception_metadata(g,m))
+        self.assertNotEqual(g,m)
+
+    def test_group_method_full_matcher_validation_and_argument_error_order(self):
+        for call,expected in (("g.split((ValueError,int))","TypeError"),
+                ("g.subgroup(((ValueError,),))","TypeError"), ("g.split([ValueError])","TypeError"),
+                ("g.split((ValueError,missing))","NameError"), ("g.subgroup()","TypeError"),
+                ("g.split(ValueError,0)","TypeError"), ("g.split(missing,0)","NameError")):
+            with self.subTest(call=call):
+                context,func,snapshot = self._solve("g=ExceptionGroup('g',[ValueError()])\n"+call+"\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error_kind,expected)
+                self.assertTrue(snapshot.unreachable(func.body[-1]))
+
+    def test_group_split_narrows_each_derived_side_from_actual_captured_children(self):
+        context,func,snapshot = self._solve("s=SystemExit()\nv=ValueError()\n"
+            "g=BaseExceptionGroup('g',[s,v])\npair=g.split(Exception)\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        parts = _ProofEffects.sequence_info(state.lookup(context.index.node_id(func),"pair"),state)[0]
+        self.assertEqual(tuple(_ProofEffects.single(value)[1][1] for value in parts),
+                         ("ExceptionGroup","BaseExceptionGroup"))
+        self.assertEqual(tuple(state.exception_object(_ProofEffects.single(value)[1]).children[0][1] for value in parts),
+                         ("ValueError","SystemExit"))
+
+    def test_saved_group_method_keeps_receiver_but_subgroup_does_not_keep_old_mutable_input(self):
+        for keep in (False,True):
+            with self.subTest(keep=keep):
+                context,func,snapshot = self._solve("v=ValueError()\nL=[v]\ng=ExceptionGroup('g',L)\n"
+                    "L[:]=[x]\nmethod=g.subgroup\n"+("keep=g\n" if keep else "")+
+                    "x=g=L=0\nm=method(ValueError)\nmethod=0\nmarker=int",parameters="x")
+                self.assertEqual(snapshot.complete,keep,snapshot.reasons)
+                self.assertEqual(snapshot.native_identity(func.body[-1].value,"int"),keep)
+
+    def test_owned_derived_group_and_saved_method_can_enter_another_same_context_region(self):
+        for binding in ("m","method","pair"):
+            with self.subTest(binding=binding):
+                suffix = "value=x(Exception)" if binding == "method" else "value=x[0]" if binding == "pair" else "value=x.message"
+                context = _ProofContext("def allocate():\n    g=ExceptionGroup('g',[ValueError()])\n"
+                    "    method=g.subgroup\n    m=method(ValueError)\n    pair=g.split(())\n"
+                    "def use(x):\n    "+suffix+"\n    marker=int\n")
+                allocate,use = context.tree.body
+                before = context.solve(allocate)
+                self.assertTrue(before.complete,before.reasons)
+                state = before.exits[0]
+                value = state.lookup(context.index.node_id(allocate),binding)
+                entry = replace(state,bindings=()).bind(context.index.node_id(use),"x",value)
+                result = context.solve(use,entry=(entry,))
+                self.assertTrue(result.complete,result.reasons)
+                self.assertTrue(result.native_identity(use.body[-1].value,"int"))
+
+    def test_leaf_id_projection_preserves_both_occurrences_and_joins_original_metadata(self):
+        context,func,snapshot = self._solve("v=ValueError()\nt=TypeError()\nh=ExceptionGroup('h',[t,v])\n"
+            "g=ExceptionGroup('g',[v,h])\nmarker=int()")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        g = _ProofEffects.single(state.lookup(owner,"g"))[1]
+        v = _ProofEffects.single(state.lookup(owner,"v"))[1]
+        stats = {"steps":0}
+        try:
+            (projected,rest),result = _ProofEffects.split_owned(state,g,("leaves",frozenset({v,g})),
+                context.index.node_id(func.body[-1].value),"project",lambda amount: context._charge(stats,amount),
+                context.limits,want_rest=False)
+        except _ProofIncomplete as error:
+            self.fail("required leaf projection incomplete: "+str(error))
+        self.assertIsNone(rest)
+        root = result.exception_object(projected)
+        self.assertEqual(root.children[0],v)
+        self.assertEqual(result.exception_object(root.children[1]).children,(v,))
+        self.assertTrue(result.same_exception_metadata(g,projected))
+        self.assertNotEqual(projected,g)
+        self.assertGreater(stats["steps"],0)
+
+    def test_group_derivation_alias_budget_counts_new_collections_and_bound_receiver(self):
+        # Hand count: original graph14 + g root1 + callee descriptor3,
+        # derived input/args/captured/group11 => peak29 before callee release.
+        for cap,complete in ((28,False),(29,True),(30,True)):
+            with self.subTest(cap=cap):
+                context,func,snapshot = self._solve("g=ExceptionGroup('g',[ValueError()])\n"
+                    "m=g.subgroup(ValueError)\nreturn m",limits={"aliases":cap})
+                self.assertEqual(snapshot.complete,complete,snapshot.reasons)
+                if not complete:
+                    self.assertIn("alias-budget",snapshot.reasons)
+
+    def test_repeated_live_group_derivation_site_does_not_retarget_prior_instance(self):
+        context,func,snapshot = self._solve("g=ExceptionGroup('g',[ValueError()])\nmarker=int()")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        root = _ProofEffects.single(state.lookup(owner,"g"))[1]
+        site = context.index.node_id(func.body[-1].value)
+        stats = {"steps":0}
+        charge = lambda amount: context._charge(stats,amount)
+        (first,unused),state = _ProofEffects.split_owned(state,root,("types",("ValueError",)),site,
+            "subgroup",charge,context.limits,want_rest=False)
+        state = state.bind(owner,"prior",_ProofValue(frozenset({("exception",first)})))
+        with self.assertRaisesRegex(_ProofIncomplete,"repeated-group-derivation"):
+            _ProofEffects.split_owned(state,root,("types",("ValueError",)),site,
+                "subgroup",charge,context.limits,want_rest=False)
+
+    def test_repeated_child_group_walk_is_bounded_before_expanding_all_occurrences(self):
+        body = "g=ExceptionGroup('0',[ValueError()])\n"
+        body += "".join("g=ExceptionGroup('g',[g,g])\n" for unused in range(10))
+        context,func,snapshot = self._solve(body+"m=g.subgroup(ValueError)\nmarker=int",limits={"depth":8})
+        self.assertFalse(snapshot.complete)
+        self.assertIn("group-depth-budget",snapshot.reasons)
+        self.assertFalse(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_saved_group_method_entry_cannot_borrow_an_unowned_or_nongroup_receiver(self):
+        context = _ProofContext("def f(method):\n    value=method(Exception)\n    marker=int\n"
+            "def allocate():\n    leaf=ValueError()\n")
+        func,allocate = context.tree.body
+        state = context.solve(allocate).exits[0]
+        leaf = _ProofEffects.single(state.lookup(context.index.node_id(allocate),"leaf"))[1]
+        for payload in (leaf,("native-exception","ExceptionGroup",context.index.node_id(allocate.body[0].value))):
+            with self.subTest(payload=payload):
+                entry = replace(state,bindings=()).bind(context.index.node_id(func),"method",
+                    _ProofValue(frozenset({("exception-method",payload,"subgroup")})))
+                result = context.solve(func,entry=(entry,))
+                self.assertFalse(result.complete)
+                self.assertIn("unowned-group-method-entry",result.reasons)
+
+    def test_raw_native_and_derived_control_ids_require_owned_exception_records(self):
+        context = _ProofContext("def f():\n    try:\n        raise\n    finally:\n        pass\n    marker=int\n"
+            "def origin():\n    int()\n")
+        func,origin = context.tree.body
+        site = context.index.node_id(origin.body[0].value)
+        saved_site = context.index.node_id(func.body[0])
+        base = ("native-exception","ExceptionGroup",site)
+        for payload in (base,base+(("subgroup","match",()),)):
+            for seed in (_ProofState(epoch=context._epoch,active=(("error",payload),)),
+                    _ProofState(epoch=context._epoch,pending=_ProofCompletion("raise",payload)),
+                    _ProofState(epoch=context._epoch,continuation=(("finally",saved_site,
+                        _ProofCompletion("raise",payload).token(),()),))):
+                with self.subTest(payload=payload,seed=seed):
+                    result = context.solve(func,entry=(seed,))
+                    self.assertFalse(result.complete)
+                    self.assertIn("unowned-exception-entry",result.reasons)
+                    self.assertFalse(result.native_identity(func.body[-1].value,"int"))
+
+    def test_group_identity_discriminators_reject_overloaded_strings_without_callbacks(self):
+        class Trap(str):
+            def __eq__(self,other):
+                raise AssertionError("validation dispatched overloaded equality")
+            __hash__ = str.__hash__
+        key = ("subgroup","match",())
+        for payload in (("native-exception","ExceptionGroup",0,(Trap("subgroup"),"match",())),
+                ("native-exception","ExceptionGroup",0,("subgroup",Trap("match"),())),
+                (Trap("native-exception"),"ExceptionGroup",0,key)):
+            with self.subTest(payload=payload):
+                with self.assertRaises(TypeError):
+                    _ProofExceptionObject(payload,origin="derived")
+        for identity in ((Trap("collection"),"list",0,"derived-input",key),
+                ("collection",Trap("list"),0,"derived-input",key),
+                ("collection","list",0,Trap("derived-input"),key)):
+            with self.subTest(identity=identity):
+                with self.assertRaises(TypeError):
+                    _ProofCollectionObject(identity)
+
+    def test_group_derivation_uses_captured_message_not_replaced_constructor_args(self):
+        context,func,snapshot = self._solve("g=ExceptionGroup('original',[ValueError()])\n"
+            "g.args=('changed',[])\nm=g.subgroup(ValueError)\nname=m.message\narg=m.args[0]\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        for name in ("name","arg"):
+            self.assertEqual(state.lookup(context.index.node_id(func),name),_ProofValue.literal("original"))
+        before = dict(context.total_compute)
+        self.assertIs(context.solve(func),snapshot)
+        self.assertEqual(dict(context.total_compute),before)
+
+    def test_group_projection_work_budget_and_cache_do_not_depend_on_query_warmth(self):
+        body = "g=ExceptionGroup('g',[ValueError(),TypeError()])\npair=g.split(ValueError)\nmarker=int"
+        context,func,snapshot = self._solve(body)
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        work = snapshot.stats["steps"]
+        original = snapshot.exits
+        for cap,complete in ((work-1,False),(work,True),(work+1,True)):
+            with self.subTest(cap=cap):
+                candidate,scope,result = self._solve(body,limits={"steps":cap})
+                self.assertEqual(result.complete,complete,result.reasons)
+                before = dict(candidate.total_compute)
+                self.assertIs(candidate.solve(scope),result)
+                self.assertEqual(dict(candidate.total_compute),before)
+                if not complete:
+                    self.assertIn("work-budget",result.reasons)
+                    self.assertFalse(result.native_identity(scope.body[-1].value,"int"))
+        self.assertEqual(snapshot.exits,original)
 
     def test_implicit_name_errors_own_args_and_runtime_name_without_inventing_local_name(self):
         for body, kind, expected in (("missing", "NameError", "missing"),
