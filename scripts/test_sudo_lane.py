@@ -6606,10 +6606,12 @@ class _ProofContext:
         self.diagnostic_policy = frozenset(diagnostic_policy)
         annotation_key = tuple(semantic_key or sys.version_info)
         self._native_profile = (annotation_key, sys.maxsize, sys.platform)
+        self._float_profile = (sys.float_info.radix, sys.float_info.mant_dig, sys.float_info.max_exp)
         self.semantic_key = (sys.implementation.name, annotation_key, sys.flags.optimize,
                              ("syntaxerror-model", "bounded-v1"),
                              ("diagnostic-effects", tuple(sorted(self.diagnostic_policy))),
-                             ("native-profile", sys.platform, sys.maxsize, tuple(sorted(_ProofEffects._errno_names.items()))))
+                             ("native-profile", sys.platform, sys.maxsize, tuple(sorted(_ProofEffects._errno_names.items()))),
+                             ("float-profile", self._float_profile))
         self.limits = dict(self._caps)
         for key, value in (limits or {}).items():
             if key not in self._caps or type(value) is not int \
@@ -6838,8 +6840,12 @@ class _ProofContext:
             return ("TypeError", "AttributeError", "NameError")
         if isinstance(node, ast.ImportFrom):
             return ("ImportError",)
+        if isinstance(node, ast.Assert):
+            return ("AssertionError",)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
             return ("TypeError",)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)):
+            return ("ZeroDivisionError", "OverflowError")
         if isinstance(node, ast.FormattedValue):
             return ("ValueError",)
         if isinstance(node, ast.AsyncFunctionDef):
@@ -7645,6 +7651,33 @@ class _ProofContext:
                         self._native_profile[0], current, lambda amount: self._charge(stats, amount), self.limits)
                     results.extend(finish(node, result, current, error))
                 return bounded(results, node)
+            elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)):
+                frontier, abrupt = operands((node.left, node.right), state)
+                results = list(abrupt)
+                for values, current in frontier:
+                    tokens = tuple(map(_ProofEffects.single, values))
+                    numeric = ("int", "bool", "float", "complex") if isinstance(node.op, ast.Div) \
+                        else ("int", "bool", "float")
+                    if not all(token and token[0] == "literal" and _ProofEffects.closed_leaf(token)
+                               and token[1] in numeric for token in tokens):
+                        raise _ProofIncomplete("unsupported-division-protocol")
+                    if any(token[1] in ("float", "complex") for token in tokens):
+                        if self._float_profile != (2, 53, 1024):
+                            raise _ProofIncomplete("unsupported-division-float-profile")
+                        # CPython converts int operands to double before its
+                        # zero check. Half-even rounding at this binary64 tie
+                        # exceeds the maximum exponent; no float() is executed.
+                        threshold = (1 << 1024) - (1 << 970)
+                        if any(token[1] == "int" and (token[2] >= threshold or token[2] <= -threshold)
+                               for token in tokens):
+                            results.extend(finish(node, None, current, "OverflowError"))
+                            continue
+                    # Only the existing native-failure seam is needed here.
+                    # No division, numeric growth or user protocol is executed.
+                    if tokens[1][2] != 0:
+                        raise _ProofIncomplete("unsupported-division-result")
+                    results.extend(finish(node, None, current, "ZeroDivisionError"))
+                return bounded(results, node)
             elif isinstance(node, ast.Compare) and all(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops):
                 frontier, results = [], []
                 for outcome in expression(node.left, state):
@@ -8400,6 +8433,28 @@ class _ProofContext:
                 statement_outcomes = None
                 if isinstance(node, (ast.Pass, ast.Global, ast.Nonlocal)):
                     pass
+                elif isinstance(node, ast.Assert):
+                    if not self.semantic_key[2]:
+                        statement_outcomes = []
+                        for outcome in expression(node.test, state):
+                            if not outcome.normal:
+                                statement_outcomes.append(outcome)
+                                continue
+                            token = _ProofEffects.single(outcome.value)
+                            if not token or token[0] != "literal" or not _ProofEffects.closed_leaf(token):
+                                raise _ProofIncomplete("opaque-truth")
+                            if bool(token[2]):
+                                statement_outcomes.append(_ProofOutcome(outcome.state))
+                                continue
+                            messages = expression(node.msg, outcome.state) if node.msg is not None \
+                                else (_ProofOutcome(outcome.state),)
+                            for message in messages:
+                                if message.normal:
+                                    arguments = () if node.msg is None else (message.value,)
+                                    current = self._implicit_error(node, "AssertionError", message.state,
+                                                                   stats, arguments=arguments)
+                                    message = _ProofOutcome(current)
+                                statement_outcomes.append(message)
                 elif isinstance(node, ast.If):
                     for outcome in expression(node.test, state):
                         if outcome.normal:
@@ -26769,6 +26824,152 @@ class ProofFlowTests(unittest.TestCase):
         context = _ProofContext(source, **kwargs)
         func = context.tree.body[0]
         return context, func, context.solve(func, entry=entry)
+
+    def test_mixed_zero_division_converts_integer_before_zero_check(self):
+        threshold = (1 << 1024) - (1 << 970)
+        for delta in (-1,0,1):
+            for sign in (-1,1):
+                number = hex(sign*(threshold+delta))
+                for operator,denominator in (("/","0.0"),("//","0.0"),("%","0.0"),("/","0j")):
+                    with self.subTest(delta=delta,sign=sign,operator=operator,denominator=denominator):
+                        context,func,snapshot = self._solve("try:\n    "+number+operator+denominator+
+                            "\nexcept OverflowError:\n    caught=True\nmarker=int")
+                        self.assertTrue(snapshot.complete,snapshot.reasons)
+                        self.assertEqual(snapshot.exits[0].pending.error_kind,"ZeroDivisionError" if delta==-1 else None)
+                        self.assertEqual(snapshot.unreachable(func.body[-1]),delta==-1)
+        context,func,snapshot = self._solve("0x1"+"0"*400+"/0\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.error_kind,"ZeroDivisionError")
+
+    def test_assertion_and_division_reject_malformed_literal_entries(self):
+        for token in (("literal",),("literal","int"),("literal","int",()),
+                ("literal","int","not_numeric"),("literal","bool",0),("literal","float",False)):
+            for expression in ("assert x","x/0.0","1/x"):
+                with self.subTest(token=token,expression=expression):
+                    context = _ProofContext("def f(x):\n    "+expression+"\n    marker=int\n")
+                    func = context.tree.body[0]
+                    state = _ProofState().bind(context.index.node_id(func),"x",_ProofValue(frozenset({token})))
+                    snapshot = context.solve(func,entry=(state,))
+                    skipped = expression=="assert x" and bool(sys.flags.optimize)
+                    self.assertEqual(snapshot.complete,skipped,snapshot.reasons)
+                    self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_assertion_observes_optimization_first_error_and_message_capture(self):
+        for statement,error,args in (("assert True,missing",None,None),
+                ("assert False","AssertionError",()),("assert False,7","AssertionError",(7,)),
+                ("assert False,missing","NameError",None),("assert missing","NameError",None)):
+            with self.subTest(statement=statement):
+                context,func,snapshot = self._solve(statement+"\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                state = snapshot.exits[0]
+                expected = None if sys.flags.optimize else error
+                self.assertEqual(state.pending.error_kind,expected)
+                self.assertEqual(snapshot.unreachable(func.body[-1]),expected is not None)
+                if expected=="AssertionError":
+                    record = state.exception_object(state.pending.error)
+                    values = _ProofEffects.sequence_info(record.args_value,state)[0]
+                    self.assertEqual(values,tuple(_ProofValue.literal(item) for item in args))
+
+    def test_assertion_error_identity_does_not_follow_rebound_spelling(self):
+        context,func,snapshot = self._solve("AssertionError=ValueError\nassert False\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.error_kind,None if sys.flags.optimize else "AssertionError")
+        context,func,snapshot = self._solve("assert x\nmarker=int",parameters="x")
+        self.assertEqual(snapshot.complete,bool(sys.flags.optimize),snapshot.reasons)
+        if not sys.flags.optimize:
+            self.assertIn("opaque-truth",snapshot.reasons)
+
+    def test_native_zero_division_is_ordered_and_requires_builtin_numeric_operands(self):
+        for expression,error in (("1/0","ZeroDivisionError"),("1//False","ZeroDivisionError"),
+                ("1%0.0","ZeroDivisionError"),("1j/0j","ZeroDivisionError"),
+                ("missing/0","NameError"),("1/missing","NameError")):
+            with self.subTest(expression=expression):
+                context,func,snapshot = self._solve(expression+"\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error_kind,error)
+                self.assertTrue(snapshot.unreachable(func.body[-1]))
+        for expression in ("x/0","1/x","1/2","1j//0","1j%0"):
+            with self.subTest(unsupported=expression):
+                context,func,snapshot = self._solve(expression+"\nmarker=int",parameters="x")
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_composed_handler_copies_survive_delete_and_skipped_handlers_do_not_delete(self):
+        for copy in ("Bad","Copy","Copy2"):
+            with self.subTest(copy=copy):
+                prefix = "Bad=AssertionError\nCopy=Bad\nCopy2=Copy\n"
+                cleanup = "except TypeError:\n            del Bad" if copy=="Bad" else "finally:\n            del Bad"
+                body = (prefix+"try:\n    try:\n        try:\n            assert False\n        "+cleanup+
+                    "\n    except (TypeError,"+copy+"):\n        raise RuntimeError\n"
+                    "    except 1/0:\n        pass\nexcept ZeroDivisionError:\n    pass\nmarker=int")
+                context,func,snapshot = self._solve(body)
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error_kind,None if sys.flags.optimize else "RuntimeError")
+                self.assertEqual(snapshot.unreachable(func.body[-1]),not sys.flags.optimize)
+        context,func,snapshot = self._solve("Bad=AssertionError\ntry:\n    try:\n        try:\n"
+            "            assert False\n        finally:\n            del Bad\n"
+            "    except (TypeError,Bad):\n        raise RuntimeError\n    except AssertionError:\n        pass\n"
+            "except NameError:\n    pass\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.kind,"normal")
+        self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_composed_header_evaluation_precedes_match_and_earlier_match_skips_later_header(self):
+        for eager in (True,False):
+            with self.subTest(eager=eager):
+                handlers = "except (AssertionError,1/0):\n        raise RuntimeError" if eager else (
+                    "except AssertionError:\n        raise RuntimeError\n    except 1/0:\n        pass")
+                context,func,snapshot = self._solve("try:\n    try:\n        assert False\n    "+handlers+
+                    "\nexcept ZeroDivisionError:\n    pass\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                error = None if eager or sys.flags.optimize else "RuntimeError"
+                self.assertEqual(snapshot.exits[0].pending.error_kind,error)
+                self.assertEqual(snapshot.unreachable(func.body[-1]),error is not None)
+
+    def test_composed_suppression_restores_c2_c3_else_and_replacement_active_contexts(self):
+        cleanup = ("try:\n    with contextlib.suppress(TypeError):\n        try:\n"
+            "            raise NameError\n        except NameError:\n            raise TypeError\nfinally:\n    raise\n")
+        for body,error in (("pass\n","RuntimeError"),("len\n","RuntimeError"),
+                ("raise LookupError\nexcept LookupError:\n    pass\n","RuntimeError"),
+                ("raise LookupError\n",None),
+                ("pass\nexcept TypeError:\n    pass\nelse:\n    raise LookupError\n",None),
+                ("raise TypeError\nexcept TypeError:\n    raise LookupError\n",None)):
+            with self.subTest(body=body):
+                parts = body.splitlines()
+                nested = "try:\n    "+parts[0]+"\n"+"".join(line+"\n" for line in parts[1:])
+                nested += "finally:\n"+"".join("    "+line+"\n" for line in cleanup.splitlines())
+                source = "import contextlib\ntry:\n"+"".join("    "+line+"\n" for line in nested.splitlines())+"except LookupError:\n    pass\nmarker=int"
+                context,func,snapshot = self._solve(source)
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error_kind,error)
+                self.assertEqual(snapshot.unreachable(func.body[-1]),error is not None)
+                self.assertFalse(snapshot.exits[0].managers)
+                self.assertFalse(snapshot.exits[0].active)
+                self.assertFalse(snapshot.exits[0].continuation)
+
+    def test_composed_first_quiet_load_and_missing_or_opaque_twins(self):
+        for first,error,complete in (("len","ValueError",True),("missing",None,True),("fail()",None,False)):
+            with self.subTest(first=first):
+                context,func,snapshot = self._solve("import contextlib\ntry:\n    try:\n"
+                    "        with contextlib.suppress(TypeError):\n            try:\n                raise NameError\n"
+                    "            except NameError:\n                raise TypeError\n    finally:\n        "+first+
+                    "\n        int('bad')\nexcept NameError:\n    pass\nmarker=int",parameters="fail")
+                self.assertEqual(snapshot.complete,complete,snapshot.reasons)
+                if complete:
+                    self.assertEqual(snapshot.exits[0].pending.error_kind,error)
+                    self.assertEqual(snapshot.unreachable(func.body[-1]),error is not None)
+                else:
+                    self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_composed_n1_manager_load_preserves_local_vs_global_and_caught_continuation(self):
+        for assignment,kind in (("","NameError"),("missing=0","UnboundLocalError")):
+            with self.subTest(assignment=assignment):
+                context,func,snapshot = self._solve("try:\n    with missing:\n        pass\n"
+                    "except NameError:\n    caught=True\n"+assignment+"\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.load_kind(func.body[0].body[0].items[0].context_expr),kind)
+                self.assertEqual(snapshot.exits[0].pending.kind,"normal")
+                self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
 
     def test_suppress_import_alias_and_enter_result_and_invalid_normal_exit(self):
         for prefix,callee in (("import contextlib as c","c.suppress"),("from contextlib import suppress as S","S")):
