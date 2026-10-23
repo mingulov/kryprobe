@@ -27,6 +27,7 @@ import io
 import shutil
 import signal
 import subprocess
+import struct
 import time
 
 sys.dont_write_bytecode = True
@@ -4542,7 +4543,123 @@ def _proof_immutable_token(value):
     return True
 
 
-@dataclass(frozen=True)
+def _proof_token_hashes(value, typed=True):
+    """Hash immutable host nodes once, never unfold shared token paths."""
+    hashes = {}
+    pending = [(value,False)]
+    while pending:
+        part,ready = pending.pop()
+        identity = id(part)
+        if identity in hashes:
+            continue
+        kind = type(part)
+        if kind in (tuple,frozenset):
+            if not ready:
+                pending.append((part,True))
+                pending.extend((child,False) for child in part if id(child) not in hashes)
+            else:
+                children = tuple(hashes[id(child)] for child in part)
+                hashes[identity] = hash(("tuple",children)) if kind is tuple else hash((
+                    "frozenset",len(children),sum(children),functools.reduce(int.__xor__,children,0)))
+        elif kind not in (type(None),bool,int,float,complex,str,bytes):
+            raise TypeError("foreign immutable identity token")
+        elif not typed:
+            hashes[identity] = hash(part)
+        elif kind is float:
+            hashes[identity] = hash(("float",struct.pack("!d",part)))
+        elif kind is complex:
+            hashes[identity] = hash(("complex",struct.pack("!dd",part.real,part.imag)))
+        else:
+            hashes[identity] = hash((kind.__name__,part))
+    return hashes
+
+
+def _proof_token_hash(value):
+    return _proof_token_hashes(value)[id(value)]
+
+
+_proof_identity_local = threading.local()
+
+
+def _proof_identity_charge():
+    meter = getattr(_proof_identity_local,"meter",None)
+    current = meter
+    while current is not None:
+        if current[1] >= current[0]:
+            raise _ProofIdentityIncomplete(current)
+        current = current[2]
+    while meter is not None:
+        meter[1] += 1
+        meter = meter[2]
+
+
+def _proof_token_equal(left, right, typed=True):
+    """Type-exact structure; fingerprints narrow matches, never prove them."""
+    if left is right:
+        return True
+    left_hashes = _proof_token_hashes(left,typed)
+    right_hashes = _proof_token_hashes(right,typed)
+    memo = {}
+
+    def equal(first,second):
+        _proof_identity_charge()  # Includes every attempted hash-bucket match.
+        root = (id(first),id(second))
+        pending = [(first,second)]
+        checked = set()
+        while pending:
+            _proof_identity_charge()
+            a,b = pending.pop()
+            pair = (id(a),id(b))
+            if pair in memo:
+                if not memo[pair]:
+                    memo[root] = False
+                    return False
+                continue
+            if pair in checked or a is b:
+                continue
+            checked.add(pair)
+            a_kind,b_kind = type(a),type(b)
+            if a_kind in (tuple,frozenset) or b_kind in (tuple,frozenset):
+                if a_kind is not b_kind or len(a)!=len(b):
+                    memo[root] = False
+                    return False
+                if a_kind is tuple:
+                    pending.extend(zip(a,b))
+                else:
+                    buckets = {}
+                    for item in b:
+                        buckets.setdefault(right_hashes[id(item)],[]).append(item)
+                    for item in a:
+                        candidates = buckets.get(left_hashes[id(item)],[])
+                        for position,candidate in enumerate(candidates):
+                            if equal(item,candidate):
+                                candidates.pop(position)
+                                break
+                        else:
+                            memo[root] = False
+                            return False
+            else:
+                same = a_kind is b_kind if typed else True
+                if same:
+                    same = (struct.pack("!d",a)==struct.pack("!d",b)) if typed and a_kind is float else (
+                        struct.pack("!dd",a.real,a.imag)==struct.pack("!dd",b.real,b.imag)) if typed and a_kind is complex else a==b
+                if not same:
+                    memo[root] = False
+                    return False
+        memo.update((pair,True) for pair in checked)
+        memo[root] = True
+        return True
+
+    return equal(left,right)
+
+
+def _proof_literal_shape(token):
+    return len(token)==3 and token[0]=="literal" and type(token[1]) is str \
+        and token[1]==type(token[2]).__name__ \
+        and type(token[2]) in (type(None),bool,int,float,complex,str,bytes)
+
+
+@dataclass(frozen=True,eq=False)
 class _ProofValue:
     """One value field, not a join of independently merged path records."""
 
@@ -4556,6 +4673,18 @@ class _ProofValue:
                 or type(self.unknown) is not bool \
                 or (self.reason is not None and type(self.reason) is not str):
             raise TypeError("proof values require immutable symbolic atoms")
+        object.__setattr__(self,"_identity_hash",hash((_proof_token_hash(self.atoms),self.unknown,self.reason)))
+        object.__setattr__(self,"_malformed_literal",any(atom[0]=="literal" and not _proof_literal_shape(atom)
+                                                      for atom in self.atoms))
+
+    def __hash__(self):
+        return self._identity_hash
+
+    def __eq__(self,other):
+        if type(other) is not _ProofValue:
+            return NotImplemented
+        return self is other or (self._identity_hash==other._identity_hash and self.unknown==other.unknown
+            and self.reason==other.reason and _proof_token_equal(self.atoms,other.atoms))
 
     @classmethod
     def literal(cls, value):
@@ -4584,6 +4713,21 @@ class _ProofValue:
     def join(self, other):
         if self.unknown or other.unknown:
             return self.unknown_value("value-join")
+        if self==other:
+            return self
+        raw_hashes = _proof_token_hashes((self.atoms,other.atoms),False)
+        buckets = {}
+        for atom in (*self.atoms,*other.atoms):
+            candidates = buckets.setdefault(raw_hashes[id(atom)],[])
+            for previous in candidates:
+                _proof_identity_charge()
+                if _proof_token_equal(previous,atom,False):
+                    if not _proof_token_equal(previous,atom):
+                        # Raw frozensets cannot retain both typed alternatives.
+                        return self.unknown_value("unrepresentable-typed-join")
+                    break
+            else:
+                candidates.append(atom)
         return _ProofValue(self.atoms | other.atoms)
 
 
@@ -4703,7 +4847,7 @@ class _ProofExceptionObject:
             + (self.message is not None)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True,eq=False)
 class _ProofState:
     bindings: tuple = ()
     regions: tuple = ()
@@ -4795,6 +4939,40 @@ class _ProofState:
                     or (region, name) in keys:
                 raise TypeError("invalid proof region")
             keys.add((region, name))
+        object.__setattr__(self,"_identity_hash",hash((_proof_token_hash(self._identity_token()),
+            tuple(hash(value) if value is not None else None for value in self._identity_values()),id(self.epoch))))
+
+    def _identity_token(self):
+        return (tuple((owner,name) for owner,name,value in self.bindings),
+            tuple((region,name) for region,name,value in self.regions),
+            (self.pending.kind,self.pending.error,self.pending.target),self.active,self.managers,self.continuation,
+            self.entry_modes,self.exception_metadata,self.borrowed_exceptions,
+            tuple((item.payload,len(item.arguments),tuple(key for key,value in item.keywords),
+                tuple(key for key,value in item.fields),item.children,item.origin) for item in self.exception_objects),
+            tuple((item.identity,len(item.items),item.depth) for item in self.collection_objects))
+
+    def _identity_values(self):
+        values = [value for owner,name,value in self.bindings]+[value for region,name,value in self.regions]
+        values.append(self.pending.value)
+        for item in self.exception_objects:
+            values.extend(item.arguments)
+            values.extend(value for key,value in item.keywords)
+            values.extend(value for key,value in item.fields)
+            values.extend((item.message,item.args_value,item.captured_value))
+        for item in self.collection_objects:
+            values.extend(item.items)
+        values.extend(self.temporaries)
+        return tuple(values)
+
+    def __hash__(self):
+        return self._identity_hash
+
+    def __eq__(self,other):
+        if type(other) is not _ProofState:
+            return NotImplemented
+        return self is other or (self.epoch is other.epoch and self._identity_hash==other._identity_hash
+            and self._identity_values()==other._identity_values()
+            and _proof_token_equal(self._identity_token(),other._identity_token()))
 
     def lookup(self, scope_id, name):
         """Raw binding slot; Python fallback/presence rules live in Effects."""
@@ -5085,13 +5263,18 @@ class _ProofEffects:
             return None
         return tuple(_ProofValue(child) for child in children), size, depth
 
+    @staticmethod
+    def read_value(value):
+        if value._malformed_literal:
+            raise _ProofIncomplete("malformed-literal-value")
+        return value
+
     @classmethod
     def closed_leaf(cls, token):
         if not token:
             return False
         if token[0] == "literal":
-            return len(token) == 3 and token[1] == type(token[2]).__name__ \
-                and type(token[2]) in (type(None), bool, int, float, complex, str, bytes)
+            return _proof_literal_shape(token)
         if token[0] == "native":
             return len(token) == 2 and token[1] in cls._builtin_names
         if token[0] == "singleton":
@@ -6586,6 +6769,8 @@ class _ProofEffects:
 
     @classmethod
     def identical(cls, first, second, state):
+        cls.read_value(first)
+        cls.read_value(second)
         left, right = cls.single(first), cls.single(second)
         if not left or not right:
             raise _ProofIncomplete("imprecise-identity")
@@ -6623,13 +6808,13 @@ class _ProofEffects:
         if {left[0], right[0]} == {"native", "singleton"}:
             return left[1] == right[1]
         if left[0] == right[0] == "opaque":
-            if left == right and left[:2] == ("opaque", "parameter"):
+            if _proof_token_equal(left,right) and left[:2] == ("opaque", "parameter"):
                 return True
         elif "opaque" not in (left[0], right[0]):
             if a != b:
                 return False
             if left[0] == right[0] == "collection":
-                if left == right:
+                if _proof_token_equal(left,right):
                     return True
                 if a == "list":
                     return False
@@ -6638,9 +6823,9 @@ class _ProofEffects:
                 if later[3] in ("slice", "captured", "args-store", "derived-args", "derived-captured", "split-result"):
                     return False  # Proven fresh AFTER the other live reference.
             elif left[0] == right[0] in ("exception", "namespace", "singleton"):
-                return left == right
+                return _proof_token_equal(left,right)
             elif left[0] == right[0] == "literal" and a in ("bool", "NoneType"):
-                return left == right
+                return _proof_token_equal(left,right)
         raise _ProofIncomplete("unproven-identity")
 
     @classmethod
@@ -7039,6 +7224,13 @@ class _ProofIncomplete(Exception):
     pass
 
 
+class _ProofIdentityIncomplete(Exception):
+    """Escape the whole request, including input/cache and snapshot equality."""
+
+    def __init__(self,meter):
+        self.meter = meter
+
+
 class _ProofContext:
     """Per-source finite analysis. No legacy reachability callback is used.
 
@@ -7086,6 +7278,7 @@ class _ProofContext:
         self._epoch = object()  # once per source, never once per loop visit
         self._cache = {}
         self._dynamic_cache = {}
+        self._identity_work = 0
         self._total_compute = {"steps": 0, "states": 0, "requests": 0, "dynamic_parses": 0}
         if len(source.encode("utf-8")) > self.limits["source_bytes"]:
             self._reasons.append("source-budget")
@@ -7166,6 +7359,10 @@ class _ProofContext:
     @property
     def total_compute(self):
         return MappingProxyType(dict(self._total_compute))
+
+    @property
+    def identity_work(self):
+        return self._identity_work
 
     def _charge(self, stats, amount=1):
         if stats["steps"] + amount > self.limits["steps"]:
@@ -7248,7 +7445,8 @@ class _ProofContext:
 
         def lookup(name):
             self._charge(stats)
-            return _ProofEffects.dynamic_name(self.index, scope, state, name, selected)
+            value, error = _ProofEffects.dynamic_name(self.index, scope, state, name, selected)
+            return _ProofEffects.read_value(value) if error is None else value, error
 
         def raised(error, name=None, receiver=None):
             fields = (("name", _ProofValue.literal(name)),) if error == "NameError" else ()
@@ -7502,6 +7700,28 @@ class _ProofContext:
         return None
 
     def solve(self, scope=None, entry=None):
+        # Semantic transfer counters stay intrinsic to the canonical request.
+        # This independent safety meter bounds physical equality work, including
+        # failed hash-bucket candidates before entry deduplication/cache lookup.
+        # It uses the configured work ceiling, never a larger private allowance.
+        previous = getattr(_proof_identity_local,"meter",None)
+        meter = [self.limits["steps"],0,previous]
+        _proof_identity_local.meter = meter
+        try:
+            return self._solve(scope,entry)
+        except _ProofIdentityIncomplete as error:
+            if error.meter is not meter:
+                raise  # A nested solve cannot grant a fresh parent allowance.
+            stats = {key:0 for key in ("steps","states","context_depth","region_keys",
+                "region_outcomes","quiet_marks","visit_work","route_points","route_slots")}
+            return _ProofSnapshot(self.index,self.tree if scope is None else scope,False,
+                ("work-budget","identity-work-budget"),MappingProxyType(stats),MappingProxyType({}),
+                epoch=self._epoch)
+        finally:
+            self._identity_work = meter[1]
+            _proof_identity_local.meter = previous
+
+    def _solve(self, scope=None, entry=None):
         scope = self.tree if scope is None else scope
         events = {}
         reasons = list(self._reasons)
@@ -7779,13 +7999,14 @@ class _ProofContext:
                 checked = set()
                 while held:
                     atoms, closed = held.pop()
-                    if (atoms, closed) in checked:
-                        continue
-                    checked.add((atoms, closed))
                     if type(atoms) is not frozenset or (closed and len(atoms) != 1) \
                             or any(type(atom) is not tuple or not atom for atom in atoms):
                         reasons.append("unsupported-composite-entry")
                         return snapshot()
+                    token_key = (_ProofValue(atoms),closed)
+                    if token_key in checked:
+                        continue
+                    checked.add(token_key)
                     for atom in atoms:
                         if atom[0] == "closure-cell" or (atom[0] == "namespace" and len(atom) == 3
                                 and type(atom[2]) is tuple and atom[2] and atom[2][0] in ("function", "class")):
@@ -8456,7 +8677,7 @@ class _ProofContext:
                 raise _ProofIncomplete("unsupported-decorator-call")
             self._charge(stats)
             if declaration.body.id == parameter:
-                return _ProofOutcome(current, argument)
+                return _ProofOutcome(current, _ProofEffects.read_value(argument))
             name = declaration.body.id
             cell = next((cell_owner for cell_owner, cell_name in self.index._function_cells[declaration]
                          if cell_name == name), None)
@@ -8472,7 +8693,7 @@ class _ProofContext:
                 return _ProofOutcome(current)
             if value.unknown or ("unbound",) in value.atoms or not value.atoms:
                 raise _ProofIncomplete("imprecise-decorator-return")
-            return _ProofOutcome(current, value)
+            return _ProofOutcome(current, _ProofEffects.read_value(value))
 
         def apply_definition(node, decorators, value, current, visits, incoming):
             operand_holds = current.temporaries
@@ -8577,6 +8798,8 @@ class _ProofContext:
             try:
                 results = []
                 for outcome in expression_inner(node, state):
+                    if outcome.normal and outcome.value is not None:
+                        _ProofEffects.read_value(outcome.value)
                     current = drop_holds(outcome.state, state.temporaries,
                         (outcome.value,) if outcome.normal and outcome.value is not None else ())
                     result = replace(outcome, state=current)
@@ -8636,7 +8859,7 @@ class _ProofContext:
                         results.append(outcome)
                         continue
                     token = _ProofEffects.single(outcome.value)
-                    if not token or token[0] != "literal":
+                    if not token or token[0] != "literal" or not _ProofEffects.closed_leaf(token):
                         raise _ProofIncomplete("opaque-unary-protocol")
                     if token[1] not in ("int", "bool", "float", "complex"):
                         results.extend(finish(node, None, outcome.state, "TypeError", visits=outcome.visits))
@@ -9569,7 +9792,7 @@ class _ProofContext:
                     for outcome in expression(node.test, state):
                         if outcome.normal:
                             token = _ProofEffects.single(outcome.value)
-                            if not token or token[0] != "literal":
+                            if not token or token[0] != "literal" or not _ProofEffects.closed_leaf(token):
                                 raise _ProofIncomplete("opaque-truth")
                             selected = "body" if bool(token[2]) else "orelse"
                             site = self.index.node_id(node)
@@ -32627,6 +32850,330 @@ class ProofStateTests(unittest.TestCase):
         factory = globals().get("_ProofContext")
         self.assertIsNotNone(factory, "immutable point-state analysis is not implemented")
         return factory(source, **kwargs)
+
+    @staticmethod
+    def _typed_cache_pairs():
+        return ((True,("literal","bool",1)),(True,("literal","bool",1.0)),
+            (1,("literal","int",True)),(1,("literal","int",1.0)),
+            (1.0,("literal","float",True)),(1.0,("literal","float",1)),
+            (complex(1,0),("literal","complex",1)))
+
+    def test_typed_cache_value_identity_preserves_actual_primitive_types(self):
+        for canonical,raw in self._typed_cache_pairs():
+            good = _ProofValue.literal(canonical)
+            bad = _ProofValue(frozenset({raw}))
+            self.assertNotEqual(good,bad)
+            self.assertEqual(good,_ProofValue.literal(canonical))
+            self.assertEqual(hash(good),hash(_ProofValue.literal(canonical)))
+        self.assertNotEqual(_ProofValue(frozenset({("literal","bool",1)})),
+                            _ProofValue(frozenset({("literal","bool",1.0)})))
+
+    def test_typed_cache_float_and_complex_identity_preserves_signed_zero(self):
+        self.assertNotEqual(_ProofValue.literal(0.0),_ProofValue.literal(-0.0))
+        self.assertNotEqual(_ProofValue.literal(complex(1,0.0)),_ProofValue.literal(complex(1,-0.0)))
+        value = _ProofValue.literal(float("nan"))
+        self.assertEqual(value,value)
+        self.assertEqual(hash(value),hash(value))
+
+    def test_typed_cache_consumed_literals_agree_when_cold_warm_and_reverse_warm(self):
+        for canonical,raw in self._typed_cache_pairs():
+            for order in ((False,),(True,False),(False,True,False)):
+                with self.subTest(raw=raw,order=order):
+                    context = self._context("def f(x):\n    if x:\n        marker=1\n    else:\n        marker=2\n    result=marker\n")
+                    func = context.tree.body[0]
+                    for valid in order:
+                        value = _ProofValue.literal(canonical) if valid else _ProofValue(frozenset({raw}))
+                        state = _ProofState().bind(context.index.node_id(func),"x",value)
+                        result = context.solve(func,entry=(state,))
+                        self.assertEqual(result.complete,valid,result.reasons)
+
+    def test_typed_cache_mixed_permuted_entries_cannot_erase_an_invalid_consumed_value(self):
+        for order in ((True,False),(False,True),(True,False,True),(False,True,False)):
+            context = self._context("def f(x):\n    if x:\n        pass\n    marker=1\n")
+            func = context.tree.body[0]
+            owner = context.index.node_id(func)
+            good = _ProofState().bind(owner,"x",_ProofValue.literal(True))
+            bad = _ProofState().bind(owner,"x",_ProofValue(frozenset({("literal","bool",1)})))
+            accepted = context.solve(func,entry=(good,))
+            self.assertTrue(accepted.complete,accepted.reasons)
+            result = context.solve(func,entry=tuple(good if valid else bad for valid in order))
+            self.assertFalse(result.complete,order)
+            self.assertFalse(result.must_execute(func.body[-1]))
+
+    def test_typed_cache_condition_and_unary_consumers_require_closed_literal_shapes(self):
+        for body in ("if x:\n    pass", "value=+x", "value=-x"):
+            for token in (("literal",),("literal","int"),("literal","bool",1),("literal","float",True)):
+                with self.subTest(body=body,token=token):
+                    context = self._context("def f(x):\n"+"".join("    "+line+"\n" for line in (body+"\nmarker=1").splitlines()))
+                    func = context.tree.body[0]
+                    state = _ProofState().bind(context.index.node_id(func),"x",_ProofValue(frozenset({token})))
+                    result = context.solve(func,entry=(state,))
+                    self.assertFalse(result.complete)
+                    self.assertFalse(result.must_execute(func.body[-1]))
+
+    def test_typed_cache_packed_finally_return_keeps_its_value_identity(self):
+        context = self._context("def f():\n    try:\n        pass\n    finally:\n        pass\ndef g():\n    pass\n")
+        func,other = context.tree.body
+        site = context.index.node_id(func.body[0])
+        entries = []
+        for value in (_ProofValue.literal(True),_ProofValue(frozenset({("literal","bool",1)}))):
+            completion = _ProofCompletion("return",value=value)
+            state = _ProofState(continuation=(("finally",site,completion.token(),()),))
+            entries.append(state)
+        self.assertNotEqual(*entries)
+        first = context.solve(other,entry=(entries[0],))
+        second = context.solve(other,entry=(entries[1],))
+        self.assertTrue(first.complete,first.reasons)
+        self.assertTrue(second.complete,second.reasons)
+        self.assertIsNot(first,second)
+
+    def test_typed_cache_every_actual_literal_read_requires_its_closed_shape(self):
+        for body in ("return x", "value=x is True", "value=int(x)", "value=x"):
+            for raw in (("literal",),("literal","bool",1),("literal","float",True)):
+                for warm in (False,True):
+                    with self.subTest(body=body,raw=raw,warm=warm):
+                        context = self._context("def f(x):\n    "+body+"\n")
+                        func = context.tree.body[0]
+                        owner = context.index.node_id(func)
+                        if warm:
+                            good = _ProofState().bind(owner,"x",_ProofValue.literal(True))
+                            accepted = context.solve(func,entry=(good,))
+                            self.assertTrue(accepted.complete,accepted.reasons)
+                        bad = _ProofState().bind(owner,"x",_ProofValue(frozenset({raw})))
+                        result = context.solve(func,entry=(bad,))
+                        self.assertFalse(result.complete,result.reasons)
+                        self.assertFalse(result.must_execute(func.body[0]))
+
+    def test_typed_cache_reference_identity_uses_typed_tokens(self):
+        left = _ProofValue(frozenset({("opaque","parameter",1,"x")}))
+        right = _ProofValue(frozenset({("opaque","parameter",True,"x")}))
+        self.assertTrue(_ProofEffects.identical(left,left,_ProofState()))
+        with self.assertRaises(_ProofIncomplete):
+            _ProofEffects.identical(left,right,_ProofState())
+        for first,second in ((("namespace","mapping",("mapping",1)),
+                              ("namespace","mapping",("mapping",True))),
+                             (("singleton","Ellipsis"),("singleton","NotImplemented"))):
+            a,b = (_ProofValue(frozenset({token})) for token in (first,second))
+            self.assertFalse(_ProofEffects.identical(a,b,_ProofState()))
+            self.assertTrue(_ProofEffects.identical(a,a,_ProofState()))
+        context = self._context("def f(x,y):\n    value=x is y\n")
+        func = context.tree.body[0]
+        owner = context.index.node_id(func)
+        result = context.solve(func,entry=(_ProofState().bind(owner,"x",left).bind(owner,"y",right),))
+        self.assertFalse(result.complete,result.reasons)
+
+    def test_typed_cache_decorator_summary_reads_validate_returned_literal_shapes(self):
+        for declaration in ("def g():\n        pass", "class G(TypeError):\n        pass"):
+            for local in (False,True):
+                for token,valid in ((("literal","bool",True),True),(("literal","bool",1),False),
+                                    (("literal",),False)):
+                    with self.subTest(declaration=declaration,local=local,token=token):
+                        context = self._context("def f("+("x" if local else "")+"):\n"
+                            "    @lambda g:x\n    "+declaration+"\n    marker=1\n")
+                        func = context.tree.body[0]
+                        owner = context.index.node_id(func) if local else 0
+                        state = _ProofState().bind(owner,"x",_ProofValue(frozenset({token})))
+                        state = state.bind(0,"__name__",_ProofValue.literal("fixture"))
+                        result = context.solve(func,entry=(state,))
+                        self.assertEqual(result.complete,valid,result.reasons)
+                        self.assertEqual(bool(result.must_execute(func.body[-1])),valid)
+
+    def test_typed_cache_dynamic_summary_reads_validate_consumed_literal_shapes(self):
+        for operation,name,expected in (("exec('x.int=lambda:1')","x","AttributeError"),
+                ("eval(\"setattr(__import__('builtins'),'int',lambda:1)\")","__import__","TypeError")):
+            for token,valid in ((("literal","bool",True),True),(("literal","bool",1),False),
+                                (("literal",),False)):
+                with self.subTest(operation=operation,token=token):
+                    context = self._context("def f():\n    "+operation+"\n    marker=1\n")
+                    func = context.tree.body[0]
+                    state = _ProofState().bind(0,name,_ProofValue(frozenset({token})))
+                    result = context.solve(func,entry=(state,))
+                    self.assertEqual(result.complete,valid,result.reasons)
+                    if valid:
+                        self.assertEqual(result.exits[0].pending.error_kind,expected)
+                    self.assertFalse(result.must_execute(func.body[-1]))
+
+    def test_typed_cache_natural_collision_comparisons_are_bounded(self):
+        atoms = [("opaque","collision",i*sys.hash_info.modulus) for i in range(128)]
+        first = _ProofValue(frozenset(atoms))
+        second = _ProofValue(frozenset(reversed(atoms)))
+        entries = tuple(_ProofState().bind(1,"x",value) for value in (first,second))
+        limited = self._context("def f(x):\n    pass\n",limits={"steps":2000})
+        result = limited.solve(limited.tree.body[0],entry=entries)
+        self.assertFalse(result.complete,result.reasons)
+        self.assertIn("work-budget",result.reasons)
+        self.assertIn("identity-work-budget",result.reasons)
+        self.assertLessEqual(limited.identity_work,2000)
+        self.assertFalse(result.events)
+        self.assertFalse(limited._cache)
+        self.assertFalse(result.must_execute(limited.tree.body[0].body[0]))
+        small = _ProofState().bind(1,"x",_ProofValue.literal(True))
+        cached = limited.solve(limited.tree.body[0],entry=(small,))
+        self.assertTrue(cached.complete,cached.reasons)
+        failed = limited.solve(limited.tree.body[0],entry=tuple(reversed(entries)))
+        self.assertFalse(failed.complete,failed.reasons)
+        self.assertIn("identity-work-budget",failed.reasons)
+        self.assertIs(limited.solve(limited.tree.body[0],entry=(small,)),cached)
+        ample = self._context("def f(x):\n    pass\n")
+        accepted = ample.solve(ample.tree.body[0],entry=entries)
+        self.assertTrue(accepted.complete,accepted.reasons)
+        self.assertGreater(ample.identity_work,2000)
+        compute = dict(ample.total_compute)
+        self.assertIs(ample.solve(ample.tree.body[0],entry=tuple(reversed(entries))),accepted)
+        self.assertEqual(dict(ample.total_compute),compute)
+
+    def test_typed_cache_identity_budget_restores_the_callers_resource_scope(self):
+        previous = getattr(_proof_identity_local,"meter",None)
+        sentinel = [1000,7,None]
+        _proof_identity_local.meter = sentinel
+        try:
+            context = self._context("def f():\n    pass\n")
+            func = context.tree.body[0]
+            self.assertTrue(context.solve(func).complete)
+            self.assertIs(_proof_identity_local.meter,sentinel)
+            with mock.patch.object(context,"_solve",side_effect=LookupError("fixture")):
+                with self.assertRaises(LookupError):
+                    context.solve(func)
+            self.assertIs(_proof_identity_local.meter,sentinel)
+            self.assertEqual(sentinel,[1000,7,None])
+        finally:
+            _proof_identity_local.meter = previous
+
+    def test_typed_cache_nested_identity_work_cannot_reset_the_parent_budget(self):
+        outer = self._context("pass\n",limits={"steps":1})
+        inner = self._context("def f(x):\n    pass\n")
+        func = inner.tree.body[0]
+        atoms = [("opaque","collision",i*sys.hash_info.modulus) for i in range(32)]
+        entries = tuple(_ProofState().bind(1,"x",_ProofValue(frozenset(items)))
+                        for items in (atoms,list(reversed(atoms))))
+        with mock.patch.object(outer,"_solve",side_effect=lambda scope,entry: inner.solve(func,entry=entries)):
+            result = outer.solve()
+        self.assertFalse(result.complete,result.reasons)
+        self.assertIn("identity-work-budget",result.reasons)
+        self.assertEqual(outer.identity_work,1)
+        self.assertFalse(inner._cache)
+        result = inner.solve(func,entry=entries)
+        self.assertTrue(result.complete,result.reasons)
+
+    def test_typed_cache_identity_budgets_are_isolated_across_threads(self):
+        barrier = threading.Barrier(2)
+        outcomes = {}
+        failures = []
+        def worker(cap):
+            try:
+                context = self._context("def f(x):\n    pass\n",limits={"steps":cap})
+                func = context.tree.body[0]
+                atoms = [("opaque","collision",i*sys.hash_info.modulus) for i in range(128)]
+                entries = tuple(_ProofState().bind(1,"x",_ProofValue(frozenset(items)))
+                                for items in (atoms,list(reversed(atoms))))
+                solve = context._solve
+                def concurrent(scope,entry):
+                    barrier.wait(timeout=5)
+                    return solve(scope,entry)
+                with mock.patch.object(context,"_solve",side_effect=concurrent):
+                    outcomes[cap] = context.solve(func,entry=entries)
+                self.assertIsNone(getattr(_proof_identity_local,"meter",None))
+            except BaseException as error:
+                failures.append(error)
+        threads = [threading.Thread(target=worker,args=(cap,)) for cap in (2000,250000)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertFalse(failures,failures)
+        self.assertFalse(outcomes[2000].complete,outcomes[2000].reasons)
+        self.assertTrue(outcomes[250000].complete,outcomes[250000].reasons)
+
+    def test_typed_cache_unused_entries_remain_distinct_through_runtime_publication(self):
+        context = self._context("def f(x):\n    pass\n    marker=1\n")
+        func = context.tree.body[0]
+        owner = context.index.node_id(func)
+        entries = tuple(_ProofState().bind(owner,"x",value) for value in (
+            _ProofValue.literal(True),_ProofValue(frozenset({("literal","bool",1)}))))
+        result = context.solve(func,entry=entries)
+        self.assertTrue(result.complete,result.reasons)
+        self.assertEqual(len(result.states_at(func.body[-1])),2)
+        self.assertEqual(len(result.exits),2)
+        self.assertTrue(result.must_execute(func.body[-1]))
+
+    def test_typed_cache_value_join_does_not_select_one_conflated_atom(self):
+        good = _ProofValue.literal(True)
+        bad = _ProofValue(frozenset({("literal","bool",1)}))
+        self.assertEqual(good.join(good),good)
+        for joined in (good.join(bad),bad.join(good)):
+            self.assertNotEqual(joined,good)
+            self.assertTrue(joined.unknown or len(joined.atoms)==2)
+
+    def test_typed_cache_shared_and_copied_host_graphs_have_equal_semantics_and_cost(self):
+        def tree(depth,shared):
+            if not depth:
+                return ("leaf",True)
+            left = tree(depth-1,shared)
+            return (left,left if shared else tree(depth-1,False))
+        values = [_ProofValue(frozenset({("opaque","dag",tree(8,shared))})) for shared in (True,False)]
+        self.assertEqual(*values)
+        self.assertEqual(hash(values[0]),hash(values[1]))
+        different = _ProofValue(frozenset({("opaque","dag",(("leaf",1),("leaf",1)))}))
+        self.assertNotEqual(_ProofValue(frozenset({("opaque","dag",tree(1,True))})),different)
+        context = self._context("def f(x):\n    pass\n")
+        func = context.tree.body[0]
+        states = [_ProofState().bind(context.index.node_id(func),"x",value) for value in values]
+        first = context.solve(func,entry=(states[0],))
+        cost = dict(context.total_compute)
+        second = context.solve(func,entry=(states[1],))
+        self.assertTrue(first.complete,first.reasons)
+        self.assertIs(first,second)
+        self.assertEqual(dict(context.total_compute),cost)
+
+    def test_typed_cache_hash_collisions_do_not_grant_equality_or_cross_epochs(self):
+        with mock.patch("builtins.hash",return_value=0):
+            good = _ProofValue.literal(True)
+            bad = _ProofValue(frozenset({("literal","bool",1)}))
+            self.assertEqual(hash(good),hash(bad))
+            self.assertNotEqual(good,bad)
+            self.assertEqual(len({good,bad}),2)
+            first = _ProofState(epoch=object()).bind(1,"x",good)
+            second = _ProofState(epoch=object()).bind(1,"x",good)
+            self.assertNotEqual(first,second)
+
+    def test_typed_cache_hashing_shared_dags_is_physical_and_caps_remain_semantic(self):
+        def dag(value,depth):
+            result = ("leaf",value)
+            for unused in range(depth):
+                result = (result,result)
+            return result
+        first,second = dag(True,24),dag(True,24)
+        hashes = _proof_token_hashes(first)
+        self.assertLessEqual(len(hashes),30)  # 2**25 semantic paths must not unfold.
+        self.assertEqual(_proof_token_hash(first),_proof_token_hash(second))
+        self.assertTrue(_proof_token_equal(first,second))
+        self.assertFalse(_proof_token_equal(first,dag(1,24)))
+        state = _ProofState(active=(("error",("unknown-exception",first,"trusted-print")),))
+        self.assertEqual(hash(state),hash(state))
+        context = self._context("def f(x):\n    pass\n")
+        func = context.tree.body[0]
+        entry = _ProofState().bind(context.index.node_id(func),"x",_ProofValue(frozenset({("opaque","dag",dag(True,1))})))
+        result = context.solve(func,entry=(entry,))
+        self.assertTrue(result.complete,result.reasons)
+        cost = result.stats["steps"]
+        for cap,want in ((cost-1,False),(cost,True),(cost+1,True)):
+            candidate = self._context("def f(x):\n    pass\n",limits={"steps":cap})
+            outcome = candidate.solve(candidate.tree.body[0],entry=(entry,))
+            self.assertEqual(outcome.complete,want,outcome.reasons)
+
+    def test_typed_cache_owned_marker_rejection_still_precedes_state_hash_and_order(self):
+        context = self._context("def f(holder):\n    pass\nclass B(TypeError):\n    pass\n")
+        func,declaration = context.tree.body
+        region = ("class",context.index.node_id(declaration))
+        state = _ProofState(epoch=context._epoch).bind(context.index.node_id(func),"holder",_ProofValue(frozenset({region})))
+        state = state.write_region(region,"$owned",_ProofValue(frozenset({("literal","bool",1)})))
+        state = state.write_region(region,"$base",_ProofValue(frozenset({("native","TypeError")})))
+        state = state.write_region(region,"$module",_ProofValue.literal("fixture"))
+        with mock.patch.object(_ProofState,"__hash__",side_effect=AssertionError("invalid state hashed")), \
+                mock.patch.object(_ProofState,"order_key",side_effect=AssertionError("invalid state ordered")):
+            result = context.solve(func,entry=(state,))
+        self.assertFalse(result.complete)
 
     def test_point_values_keep_rhs_order_and_saved_copies(self):
         context = self._context("def f():\n    x=1\n    y=x\n    x=2\n")
