@@ -6600,6 +6600,87 @@ class _ProofSnapshot:
     region_quiet: object = None
     suite_bad: object = None
     trace_complete: bool = False
+    region_entries: object = None
+
+    def must_execute(self, event, incoming=None, region=None):
+        return self._route_query(event, incoming, region, None, False)
+
+    def target_unreachable(self, event, incoming=None, continuation=None, region=None):
+        return self._route_query(event, incoming, region, continuation, True)
+
+    def _route_query(self, event, incoming, region, continuation, never):
+        if not self.complete:
+            return _ProofQueryResult(False, None, self.reasons)
+        if not self.trace_complete or self.region_entries is None:
+            return _ProofQueryResult(False, None, ("incomplete-route-facts",))
+        if type(event) is tuple:
+            if len(event) != 2:
+                return _ProofQueryResult(False, None, ("invalid-event",))
+            event, role = event
+        else:
+            role = "before"
+        region = self.scope if region is None else region
+        try:
+            event_owner, position = self.index.event_id(event, role)
+            site = self.index.node_id(region)
+        except KeyError:
+            return _ProofQueryResult(False, None, ("foreign-event-or-region",))
+        if event_owner is not self.scope:
+            return _ProofQueryResult(False, None, ("foreign-event-owner",))
+        ancestor = event
+        while ancestor is not None and ancestor is not region:
+            ancestor = self.index.parent(ancestor)
+        if ancestor is None:
+            return _ProofQueryResult(False, None, ("event-outside-region",))
+        observed = self.region_entries.get(site, ())
+        if incoming is None:
+            selected = observed
+        else:
+            states = (incoming,) if type(incoming) is _ProofState else incoming
+            if type(states) not in (tuple, frozenset) or not states or len(states) > _ProofContext._caps["alternatives"]:
+                return _ProofQueryResult(False, None, ("invalid-incoming",))
+            selected = []
+            for state in states:
+                if type(state) is not _ProofState or state.epoch is not self.epoch:
+                    return _ProofQueryResult(False, None, ("foreign-state",))
+                # A route selector names an actual published input record.
+                # Do not hash or compare an unobserved caller-supplied graph:
+                # even a closed tuple DAG can expand exponentially on3.12.
+                origin = next((origin for observed_state, origin in observed if observed_state is state), None)
+                if origin is None:
+                    return _ProofQueryResult(False, None, ("unobserved-region-entry",))
+                selected.append((state, origin))
+        if not selected:
+            return _ProofQueryResult(False, None, ("unobserved-region-entry",))
+        if continuation is not None:
+            if type(continuation) is not tuple:
+                return _ProofQueryResult(False, None, ("invalid-continuation",))
+            # Validate a closed, bounded selector before equality can invoke
+            # foreign callbacks or recursively expand an arbitrary token DAG.
+            pending = [(continuation, 0)]
+            remaining = _ProofContext._caps["steps"]
+            while pending:
+                part, depth = pending.pop()
+                remaining -= 1
+                if remaining < 0 or depth > _ProofContext._caps["depth"] + _ProofContext._caps["contexts"] + 16:
+                    return _ProofQueryResult(False, None, ("invalid-continuation",))
+                if type(part) in (tuple, frozenset):
+                    if len(part) > remaining - len(pending):
+                        return _ProofQueryResult(False, None, ("invalid-continuation",))
+                    pending.extend((child, depth + 1) for child in part)
+                elif type(part) not in (type(None), bool, int, float, complex, str, bytes):
+                    return _ProofQueryResult(False, None, ("invalid-continuation",))
+            if any(state.continuation != continuation for state, unused in selected):
+                return _ProofQueryResult(False, None, ("mismatched-continuation",))
+        bit = 1 << position
+        answers = []
+        for state, origin in selected:
+            outcomes = self.region_results.get(origin, ())
+            if not outcomes:
+                return _ProofQueryResult(False, None, ("missing-route-outcomes",))
+            answers.extend(not bool(item.visits.may & bit) if never else bool(item.visits.must & bit)
+                           for item in outcomes)
+        return _ProofQueryResult(True, all(answers))
 
     def quiet_prefix(self, region, state):
         """A completed universal no-error/no-observable-effect prefix fact.
@@ -6692,6 +6773,8 @@ class _ProofSnapshot:
 
     def unreachable(self, target):
         # Empty events in an incomplete or unanalysed region are NOT bottom.
+        if self.trace_complete:
+            return bool(self.target_unreachable(target))
         if not self.complete or self.index is None \
                 or not isinstance(target, (ast.stmt, ast.expr)):
             return False
@@ -7090,16 +7173,21 @@ class _ProofContext:
         events = {}
         reasons = list(self._reasons)
         exits = []
-        observations = []
+        observations = {}
         region_results = {}
         region_origins = {}
+        region_entries = {}
+        origin_sites = {}
         region_quiet = {}
         suite_bad = {}
         active_origins = ()
         active_suites = ()
         sync_origins = []
+        active_traces = ()
+        trace_complete = False
         stats = {"steps": 0, "states": 0, "context_depth": 0,
-                 "region_keys": 0, "region_outcomes": 0, "quiet_marks": 0, "visit_work": 0}
+                 "region_keys": 0, "region_outcomes": 0, "quiet_marks": 0, "visit_work": 0,
+                 "route_points": 0, "route_slots": 0}
 
         def snapshot():
             return _ProofSnapshot(self.index, scope, not reasons,
@@ -7108,10 +7196,11 @@ class _ProofContext:
                                   MappingProxyType({key: tuple(states)
                                                     for key, states in events.items()}),
                                   tuple(dict.fromkeys(exits)), self._epoch,
-                                  tuple(dict.fromkeys(observations)),
+                                  tuple(observations.values()),
                                   MappingProxyType({key: tuple(items) for key, items in region_results.items()}),
                                   MappingProxyType(region_origins),
-                                  MappingProxyType(region_quiet), MappingProxyType(suite_bad))
+                                  MappingProxyType(region_quiet), MappingProxyType(suite_bad), trace_complete,
+                                  MappingProxyType({key: tuple(items) for key, items in region_entries.items()}))
 
         if reasons:
             return snapshot()
@@ -7588,6 +7677,9 @@ class _ProofContext:
                 stats["region_keys"] += 1
                 origin = len(region_origins)
                 region_origins[key] = origin
+                origin_sites[origin] = key[0]
+                self._charge(stats)
+                region_entries.setdefault(key[0], []).append((incoming, origin))
                 region_results[origin] = []
                 region_quiet[origin] = True
             return origin
@@ -7629,9 +7721,25 @@ class _ProofContext:
             if current.exception_objects or current.collection_objects:
                 self._charge(stats, _ProofEffects.exception_work(current))
                 current = _ProofEffects.prune_exception_objects(current)
-            result = _ProofOutcome(current, observation=outcome.observation, visits=outcome.visits)
+            visits = outcome.visits
+            if outcome.normal:
+                visits = visit_then(visits, visit_event(self.index.node_for_id(origin_sites[origin]), "after"))
+            result = _ProofOutcome(current, observation=outcome.observation,
+                visits=visit_then(trace_for(origin), visits))
             record_region(origin, result)
-            return outcome
+            return replace(outcome, visits=visits)
+
+        def trace_for(origin):
+            visit_charge(1 + len(active_traces))
+            return next((visits for key, visits in active_traces if key == origin), _ProofVisits())
+
+        def trace_add(visits):
+            nonlocal active_traces
+            visit_charge(1 + len(active_traces))
+            active_traces = tuple((origin, visit_then(old, visits)) for origin, old in active_traces)
+
+        def trace_result(origin, outcome):
+            return replace(outcome, visits=visit_then(trace_for(origin), outcome.visits))
 
         def bounded(items, event=None):
             unique = {}
@@ -8225,8 +8333,10 @@ class _ProofContext:
             # whole remaining bodies or recursively invoking solve. Every
             # work item retains its whole correlated state and cursor stack.
             queue = deque()
+            routes = {}
+            queued = set()
 
-            def enqueue(cursor, state, observation=None):
+            def enqueue(cursor, state, observation=None, visits=_ProofVisits()):
                 if state.exception_objects or state.collection_objects:
                     self._charge(stats, _ProofEffects.exception_work(state))
                     state = _ProofEffects.prune_exception_objects(state)
@@ -8245,10 +8355,34 @@ class _ProofContext:
                 stats["context_depth"] = max(stats["context_depth"], depth)
                 action = "observe" if observation is not None else (
                     "dispatch" if state.pending.kind != "normal" else "step")
-                queue.append((action, cursor, _ProofOutcome(state, observation=observation)))
+                visit_charge(1 + len(active_traces) + len(cursor))
+                origins = tuple(frame[2] for frame in cursor if frame[1] in ("after", "scope-exit"))
+                key = (action, cursor, _ProofOutcome(state, observation=observation))
+                if key not in routes:
+                    slots = 1 + len(origins)
+                    if stats["states"] + slots > self.limits["states"]:
+                        raise _ProofIncomplete("state-budget")
+                    stats["states"] += slots
+                    self._total_compute["states"] += slots
+                    stats["route_points"] += 1
+                    stats["route_slots"] += slots
+                current = dict(active_traces)
+                trace = tuple((origin, visit_then(current.get(origin, _ProofVisits()), visits)) for origin in origins)
+                if key in routes:
+                    previous = routes[key]
+                    joined = tuple((origin, visit_join(left, right))
+                                   for (origin, left), (unused, right) in zip(previous, trace))
+                    if all(left is right for (unused, left), (unused2, right) in zip(previous, joined)):
+                        return
+                    routes[key] = joined
+                else:
+                    routes[key] = trace
+                if key not in queued:
+                    queued.add(key)
+                    queue.append(key)
 
             def route(cursor, outcome):
-                enqueue(cursor, outcome.state, outcome.observation)
+                enqueue(cursor, outcome.state, outcome.observation, outcome.visits)
 
             def terminal(state):
                 # Coroutine escape converts StopIteration after all in-frame
@@ -8268,12 +8402,15 @@ class _ProofContext:
                     self._check_alias_budget(state, stats)
                 exits.append(state)
                 root = next(frame for frame in cursor if frame[1] == "scope-exit")
-                record_region(root[2], _ProofOutcome(state))
+                if state.pending.kind != "diverge":
+                    trace_add(visit_event(scope, "exit"))
+                    record(scope, "exit", state)
+                record_region(root[2], trace_result(root[2], _ProofOutcome(state)))
 
             def observe_regions(cursor, outcome):
                 for site, field, incoming in cursor:
                     if field in ("after", "scope-exit"):
-                        record_region(incoming, outcome)
+                        record_region(incoming, trace_result(incoming, outcome))
 
             def begin_finally(cursor, state):
                 site = cursor[-1][0]
@@ -8316,14 +8453,14 @@ class _ProofContext:
                                   continuation=state.continuation + (saved,))
                 enqueue(cursor[:-1] + ((site, "handler-next", 0),), current)
 
-            def finish_search(cursor, state, pending):
+            def finish_search(cursor, state, pending, visits=_ProofVisits()):
                 site = cursor[-1][0]
                 if not state.continuation or state.continuation[-1][:2] != ("except-search", site):
                     raise _ProofIncomplete("foreign-handler-search")
                 saved = state.continuation[-1]
                 current = replace(state, pending=pending, active=saved[3],
                                   continuation=state.continuation[:-1])
-                enqueue(cursor[:-1], current)
+                enqueue(cursor[:-1], current, visits=visits)
 
             def resume_handler(cursor, state):
                 site = cursor[-1][0]
@@ -8373,14 +8510,14 @@ class _ProofContext:
                 self._check_alias_budget(current, stats)
                 enqueue(cursor[:-1] + ((site, "star-next", 0),), current)
 
-            def finish_star(cursor, state, pending):
+            def finish_star(cursor, state, pending, visits=_ProofVisits()):
                 saved = star_frame(cursor, state)
                 current = replace(state, pending=pending, active=saved[8], continuation=state.continuation[:-1])
                 dropped = star_refs(saved)
                 reserve_graph(state, dropped, passes=2)
                 _ProofEffects.check_dropped(state, current, dropped)
                 self._check_alias_budget(current, stats)
-                enqueue(cursor[:-1], current)
+                enqueue(cursor[:-1], current, visits=visits)
 
             def resume_star_body(cursor, state):
                 saved = star_frame(cursor, state)
@@ -8458,6 +8595,7 @@ class _ProofContext:
                 pending = state.pending
                 receiver = _ProofValue(frozenset({frame[2]}))
                 record(item, "exit", current)
+                trace_add(visit_event(item, "exit"))
                 if pending.kind == "raise":
                     current = replace(current, active=frame[4] + (("error", pending.error),))
                     depth = current.context_depth()
@@ -8533,13 +8671,13 @@ class _ProofContext:
                 enqueue(cursor[:-1], current)
 
             for state in dict.fromkeys(entry):
-                enqueue(((owner, "scope-exit", region_origin(scope, state)), (owner, "body", 0)), state)
-            seen = set()
+                enqueue(((owner, "scope-exit", region_origin(scope, state)), (owner, "body", 0)), state,
+                        visits=visit_event(scope, "entry"))
             while queue:
-                action, cursor, outcome = queue.popleft()
-                if (action, cursor, outcome) in seen:
-                    continue
-                seen.add((action, cursor, outcome))
+                key = queue.popleft()
+                queued.remove(key)
+                action, cursor, outcome = key
+                active_traces = routes[key]
                 state = outcome.state
                 active_origins = tuple(frame[2] for frame in cursor if frame[1] in ("after", "scope-exit"))
                 phases = []
@@ -8553,7 +8691,20 @@ class _ProofContext:
                 active_suites = tuple(phases)
                 if action == "observe":
                     self._charge(stats)
-                    observations.append(outcome)
+                    root = next(frame for frame in cursor if frame[1] == "scope-exit")
+                    observed = trace_result(root[2], outcome)
+                    self._charge(stats, 2 * _ProofEffects.exception_work(observed.state))
+                    observation_key = runtime_outcome(observed)
+                    if observation_key in observations:
+                        previous = observations[observation_key]
+                        observations[observation_key] = replace(previous,
+                            visits=visit_join(previous.visits, observed.visits))
+                    else:
+                        if stats["states"] >= self.limits["states"]:
+                            raise _ProofIncomplete("state-budget")
+                        stats["states"] += 1
+                        self._total_compute["states"] += 1
+                        observations[observation_key] = observed
                     observe_regions(cursor, outcome)
                     continue
                 if action == "dispatch":
@@ -8589,7 +8740,7 @@ class _ProofContext:
                             destination = cursor[:offset] if state.pending.kind == "break" else cursor[:offset + 1]
                             enqueue(destination, replace(state, pending=_ProofCompletion()))
                         elif field == "after":
-                            record_region(position, outcome)
+                            record_region(position, trace_result(position, outcome))
                             continue
                         elif field not in ("body", "orelse", "scope-exit", "suite-exit", "for-first", "for-next", "finalbody", "try-body-done", "with-item"):
                             raise _ProofIncomplete("unsupported-dispatch-frame")
@@ -8630,7 +8781,7 @@ class _ProofContext:
                         if not _ProofEffects.suppress_instance(token):
                             if token and (_ProofEffects.closed_leaf(token) or token[0] == "collection"):
                                 current = self._implicit_error(item, "TypeError", outcome.state, stats)
-                                enqueue(cursor, current)
+                                enqueue(cursor, current, visits=outcome.visits)
                             else:
                                 raise _ProofIncomplete("opaque-manager-entry")
                             continue
@@ -8644,13 +8795,14 @@ class _ProofContext:
                         current = replace(current, managers=current.managers + (frame,))
                         self._check_alias_budget(current, stats)
                         record(item, "entry", current)
+                        prefix = visit_then(outcome.visits, visit_event(item, "entry"))
                         following = cursor[:-1] + ((container_id, "with-exit", position),
                                                   (container_id, "with-item", position + 1))
                         if item.optional_vars is None:
-                            enqueue(following, current)
+                            enqueue(following, current, visits=prefix)
                         else:
                             for assigned in target_store(item.optional_vars, _ProofValue.literal(None), current):
-                                route(following, assigned)
+                                route(following, prepend_visit(prefix, assigned))
                     continue
                 if field == "try-body-done":
                     self._charge(stats)
@@ -8670,6 +8822,7 @@ class _ProofContext:
                         continue
                     handler = container.handlers[position]
                     record(handler, "before", state)
+                    trace_add(visit_event(handler, "before"))
                     types = handler_expression(handler.type, state) if handler.type is not None else (
                         _ProofOutcome(state, _ProofValue.literal(None)),)
                     for outcome in types:
@@ -8680,9 +8833,10 @@ class _ProofContext:
                             if handler.type is not None else (True, None)
                         if error is not None:
                             current = self._implicit_error(handler, error, outcome.state, stats)
-                            finish_search(cursor, current, current.pending)
+                            finish_search(cursor, current, current.pending, outcome.visits)
                         elif not matches:
-                            enqueue(cursor[:-1] + ((container_id, "handler-next", position + 1),), outcome.state)
+                            enqueue(cursor[:-1] + ((container_id, "handler-next", position + 1),), outcome.state,
+                                    visits=outcome.visits)
                         else:
                             site = self.index.node_id(handler)
                             current = replace(outcome.state, continuation=outcome.state.continuation[:-1]
@@ -8690,7 +8844,8 @@ class _ProofContext:
                             if handler.name is not None:
                                 current = bind_name(handler.name, _ProofValue(frozenset({("exception", saved[2])})), current)
                             record(handler, "entry", current)
-                            enqueue(cursor[:-1] + ((site, "handler-resume", 0), (site, "body", 0)), current)
+                            enqueue(cursor[:-1] + ((site, "handler-resume", 0), (site, "body", 0)), current,
+                                    visits=visit_then(outcome.visits, visit_event(handler, "entry")))
                     continue
                 if field == "star-body-resume":
                     self._charge(stats)
@@ -8706,6 +8861,7 @@ class _ProofContext:
                         continue
                     handler = container.handlers[position]
                     record(handler, "before", state)
+                    trace_add(visit_event(handler, "before"))
                     for outcome in handler_expression(handler.type, state):
                         if not outcome.normal:
                             route(cursor, outcome)
@@ -8714,7 +8870,7 @@ class _ProofContext:
                             lambda amount: self._charge(stats, amount))
                         if error is not None:
                             current = self._implicit_error(handler, error, outcome.state, stats)
-                            finish_star(cursor, current, current.pending)
+                            finish_star(cursor, current, current.pending, outcome.visits)
                             continue
                         matched, residual = None, saved[5]
                         current = outcome.state
@@ -8734,13 +8890,15 @@ class _ProofContext:
                         current = publish_star(current, saved, updated,
                             saved[8] + (("error", matched),) if matched is not None else current.active)
                         if matched is None:
-                            enqueue(cursor[:-1] + ((container_id, "star-next", position + 1),), current)
+                            enqueue(cursor[:-1] + ((container_id, "star-next", position + 1),), current,
+                                    visits=outcome.visits)
                         else:
                             site = self.index.node_id(handler)
                             if handler.name is not None:
                                 current = bind_name(handler.name, _ProofValue(frozenset({("exception", matched)})), current)
                             record(handler, "entry", current)
-                            enqueue(cursor[:-1] + ((container_id, "star-body-resume", position), (site, "body", 0)), current)
+                            enqueue(cursor[:-1] + ((container_id, "star-body-resume", position), (site, "body", 0)), current,
+                                    visits=visit_then(outcome.visits, visit_event(handler, "entry")))
                     continue
                 if field == "finally-enter":
                     self._charge(stats)
@@ -8752,12 +8910,14 @@ class _ProofContext:
                     continue
                 if field == "after":
                     record(container, "after", state)
-                    record_region(position, _ProofOutcome(state))
+                    trace_add(visit_event(container, "after"))
+                    record_region(position, trace_result(position, _ProofOutcome(state)))
                     enqueue(cursor[:-1], state)
                     continue
                 if field in ("for-first", "for-next"):
                     self._charge(stats)
                     record(container, "next", state)
+                    trace_add(visit_event(container, "next"))
                     value, error = _ProofEffects.iterator_next(_ProofValue(frozenset({position})))
                     if error == "StopIteration":
                         enqueue(cursor[:-1] + ((container_id, "orelse", 0),), state)
@@ -8794,6 +8954,8 @@ class _ProofContext:
                 record(node, "before", state)
                 origin = region_origin(node, state)
                 active_origins += (origin,)
+                active_traces += ((origin, _ProofVisits()),)
+                trace_add(visit_event(node, "before"))
                 statement_outcomes = None
                 if isinstance(node, (ast.Pass, ast.Global, ast.Nonlocal)):
                     pass
@@ -8808,7 +8970,7 @@ class _ProofContext:
                             if not token or token[0] != "literal" or not _ProofEffects.closed_leaf(token):
                                 raise _ProofIncomplete("opaque-truth")
                             if bool(token[2]):
-                                statement_outcomes.append(_ProofOutcome(outcome.state))
+                                statement_outcomes.append(_ProofOutcome(outcome.state, visits=outcome.visits))
                                 continue
                             messages = expression(node.msg, outcome.state) if node.msg is not None \
                                 else (_ProofOutcome(outcome.state),)
@@ -8817,8 +8979,8 @@ class _ProofContext:
                                     arguments = () if node.msg is None else (message.value,)
                                     current = self._implicit_error(node, "AssertionError", message.state,
                                                                    stats, arguments=arguments)
-                                    message = _ProofOutcome(current)
-                                statement_outcomes.append(message)
+                                    message = _ProofOutcome(current, visits=message.visits)
+                                statement_outcomes.append(prepend_visit(outcome.visits, message))
                 elif isinstance(node, ast.If):
                     for outcome in expression(node.test, state):
                         if outcome.normal:
@@ -8850,7 +9012,8 @@ class _ProofContext:
                     state = replace(state, pending=_ProofCompletion(
                         "break" if isinstance(node, ast.Break) else "continue", target=cursor[destination][0]))
                     record(node, "transfer", state)
-                    route(successor, statement_result(origin, _ProofOutcome(state)))
+                    route(successor, statement_result(origin, _ProofOutcome(state,
+                        visits=visit_event(node, "transfer"))))
                     continue
                 elif isinstance(node, (ast.Try, ast.TryStar)):
                     site = self.index.node_id(node)
@@ -8871,7 +9034,8 @@ class _ProofContext:
                     for outcome in values:
                         if outcome.normal:
                             outcome = _ProofOutcome(replace(outcome.state, pending=_ProofCompletion(
-                                "return", value=outcome.value)))
+                                "return", value=outcome.value)),
+                                visits=visit_then(outcome.visits, visit_event(node, "transfer")))
                             record(node, "transfer", outcome.state)
                         route(successor, statement_result(origin, outcome))
                     continue
@@ -8899,7 +9063,8 @@ class _ProofContext:
                                 else replace(current, pending=_ProofCompletion("raise", payload))
                             current = drop_holds(current, state.temporaries)
                             record(node, "transfer", current)
-                            route(successor, statement_result(origin, _ProofOutcome(current)))
+                            route(successor, statement_result(origin, _ProofOutcome(current,
+                                visits=visit_then(visits, visit_event(node, "transfer")))))
                         continue
                     if not state.active or state.active[-1] == ("no-active",):
                         state = self._implicit_error(node, "RuntimeError", state, stats)
@@ -8912,7 +9077,8 @@ class _ProofContext:
                         raise _ProofIncomplete("unknown-active-exception")
                     state = replace(state, pending=_ProofCompletion("raise", error))
                     record(node, "transfer", state)
-                    route(successor, statement_result(origin, _ProofOutcome(state)))
+                    route(successor, statement_result(origin, _ProofOutcome(state,
+                        visits=visit_event(node, "transfer"))))
                     continue
                 elif isinstance(node, ast.Import):
                     if _ProofEffects.frame_builtin(state, "__import__") != _ProofValue(
@@ -8984,6 +9150,7 @@ class _ProofContext:
                     if result.normal:
                         record(node, "after", result.state)
                     route(successor, result)
+            trace_complete = True
         except _ProofIncomplete as error:
             reasons.append(str(error))
         except (MemoryError, RecursionError):
@@ -27193,6 +27360,246 @@ class ProofFlowTests(unittest.TestCase):
         func = context.tree.body[0]
         return context, func, context.solve(func, entry=entry)
 
+    def test_route_call_entry_cannot_prove_invocation_after_argument_error(self):
+        context,func,snapshot = self._solve("int(missing)\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"must_execute",None)))
+        call = func.body[0].value
+        for event,want in ((call,True),((call,"invoke"),False),((call,"after"),False)):
+            result = snapshot.must_execute(event)
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual(result.value,want)
+        result = snapshot.target_unreachable((call,"invoke"))
+        self.assertTrue(result.complete,result.reasons)
+        self.assertTrue(result)
+        self.assertTrue(snapshot.unreachable(func.body[1]))
+
+    def test_route_caught_failure_can_still_require_publication(self):
+        context,func,snapshot = self._solve("try:\n    int('bad')\nexcept ValueError:\n    pass\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"must_execute",None)))
+        entry = snapshot.states_at(func,"entry")[0]
+        self.assertFalse(snapshot.quiet_prefix(func,entry))
+        self.assertTrue(snapshot.must_execute(func.body[1]))
+        self.assertFalse(snapshot.target_unreachable(func.body[1]))
+        self.assertTrue(snapshot.must_execute((func.body[0].handlers[0],"entry")))
+
+    def test_route_finally_runs_on_return_and_never_on_proven_divergence(self):
+        for transfer,want in (("return",True),("for x in iter(int,1):\n        pass",False)):
+            context,func,snapshot = self._solve("try:\n    "+transfer+"\nfinally:\n    cleanup=int\nmarker=int")
+            self.assertTrue(callable(getattr(snapshot,"must_execute",None)))
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            cleanup = func.body[0].finalbody[0]
+            self.assertEqual(bool(snapshot.must_execute(cleanup)),want)
+            self.assertEqual(bool(snapshot.target_unreachable(cleanup)),not want)
+            self.assertTrue(snapshot.target_unreachable(func.body[1]))
+            self.assertEqual(bool(snapshot.must_execute((func,"exit"))),want)
+
+    def test_route_manager_suppression_and_replacement_reach_their_targets(self):
+        for matcher,tail in (("ValueError","marker=int"),("0","except TypeError:\n    marker=int")):
+            body = "import contextlib\nwith contextlib.suppress("+matcher+"):\n    raise ValueError\n"
+            if matcher=="0":
+                body = "import contextlib\ntry:\n    with contextlib.suppress(0):\n        raise ValueError\n"+tail
+            else:
+                body += tail
+            context,func,snapshot = self._solve(body)
+            self.assertTrue(callable(getattr(snapshot,"must_execute",None)))
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            manager = func.body[1] if matcher=="ValueError" else func.body[1].body[0]
+            marker = func.body[2] if matcher=="ValueError" else func.body[1].handlers[0].body[0]
+            self.assertTrue(snapshot.must_execute(marker))
+            for role in ("entry","exit"):
+                self.assertTrue(snapshot.must_execute((manager.items[0],role)))
+
+    def test_route_multiple_inputs_quantify_all_entries_and_preserve_each_branch(self):
+        source = "def f(flag):\n    if flag:\n        left=int\n    else:\n        right=int\n    marker=int\n"
+        context = _ProofContext(source)
+        func = context.tree.body[0]
+        owner = context.index.node_id(func)
+        entry = tuple(_ProofState().bind(owner,"flag",_ProofValue.literal(value)) for value in (True,False))
+        snapshot = context.solve(func,entry=entry)
+        self.assertTrue(callable(getattr(snapshot,"must_execute",None)))
+        branch = func.body[0]
+        self.assertTrue(snapshot.must_execute(func.body[1]))
+        self.assertFalse(snapshot.must_execute(branch.body[0]))
+        self.assertFalse(snapshot.target_unreachable(branch.body[0]))
+        for state in snapshot.states_at(func,"entry"):
+            selected = snapshot.value_at(branch.test,"flag",state)==_ProofValue.literal(True)
+            self.assertEqual(bool(snapshot.must_execute(branch.body[0],incoming=state)),selected)
+            self.assertEqual(bool(snapshot.target_unreachable(branch.body[0],incoming=state)),not selected)
+
+    def test_route_region_query_rejects_earlier_and_later_publication(self):
+        context,func,snapshot = self._solve("earlier=int\ntry:\n    body=int\nexcept ValueError:\n    pass\nlater=int")
+        self.assertTrue(callable(getattr(snapshot,"must_execute",None)))
+        region = func.body[1]
+        self.assertTrue(snapshot.must_execute(region.body[0],region=region))
+        for target in (func.body[0],func.body[2]):
+            for query in (snapshot.must_execute,snapshot.target_unreachable):
+                result = query(target,region=region)
+                self.assertFalse(result.complete)
+                self.assertFalse(result)
+
+    def test_route_converged_runtime_state_intersects_histories_and_keeps_divergence(self):
+        context,func,snapshot = self._solve("try:\n    print('ok')\nexcept:\n    pass\nmarker=int",diagnostic_policy=("print",))
+        self.assertTrue(callable(getattr(snapshot,"must_execute",None)))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        call = func.body[0].body[0].value
+        handler = func.body[0].handlers[0].body[0]
+        outputs = snapshot.outcomes(func,snapshot.states_at(func,"entry")[0])
+        normal = [item for item in outputs.alternatives if item.normal]
+        self.assertEqual(len(normal),1)
+        for event in ((call,"after"),handler):
+            node,role = event if type(event) is tuple else (event,"before")
+            bit = 1<<context.index.event_id(node,role)[1]
+            self.assertTrue(normal[0].visits.may & bit)
+            self.assertFalse(normal[0].visits.must & bit)
+        self.assertTrue(snapshot.must_execute((call,"invoke")))
+        self.assertFalse(snapshot.must_execute(func.body[1]))
+        self.assertFalse(snapshot.target_unreachable(func.body[1]))
+
+    def test_route_handler_headers_and_entries_have_distinct_arrival_facts(self):
+        context,func,snapshot = self._solve("try:\n    1/0\nexcept ValueError:\n    wrong=int\nexcept ZeroDivisionError as error:\n    right=int\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"must_execute",None)))
+        first,second = func.body[0].handlers
+        for event,want in (((first,"before"),True),((first,"entry"),False),
+                ((second,"entry"),True),(second.body[0],True),(func.body[1],True)):
+            result = snapshot.must_execute(event)
+            self.assertTrue(result.complete,result.reasons)
+            self.assertEqual(result.value,want)
+        self.assertTrue(snapshot.target_unreachable(first.body[0]))
+
+    def test_route_invalid_empty_hypothetical_and_mismatched_continuations_cannot_prune(self):
+        context,func,snapshot = self._solve("try:\n    return\nfinally:\n    marker=int")
+        self.assertTrue(callable(getattr(snapshot,"must_execute",None)))
+        marker = func.body[0].finalbody[0]
+        state = snapshot.states_at(marker)[0]
+        self.assertTrue(snapshot.must_execute(marker,incoming=state,region=marker))
+        self.assertTrue(snapshot.target_unreachable((marker,"after"),incoming=state,
+            region=marker,continuation=state.continuation).complete)
+        for event,kwargs in ((marker,{"incoming":()}),(marker,{"incoming":replace(state,pending=_ProofCompletion("diverge")),"region":marker}),
+                (marker,{"incoming":state,"region":marker,"continuation":()}),((marker,"invkoe"),{}),
+                ((marker,"invoke"),{}),(ast.Name(id="foreign",ctx=ast.Load()),{})):
+            result = snapshot.target_unreachable(event,**kwargs)
+            self.assertFalse(result.complete)
+            self.assertFalse(result)
+
+    def test_route_queries_are_immutable_and_budget_incompletion_never_proves(self):
+        context,func,snapshot = self._solve("return\nmarker=int")
+        self.assertTrue(callable(getattr(snapshot,"must_execute",None)))
+        before = dict(context._total_compute)
+        for unused in range(3):
+            self.assertTrue(snapshot.must_execute(func.body[0]))
+            self.assertTrue(snapshot.target_unreachable(func.body[1]))
+        self.assertEqual(dict(context._total_compute),before)
+        self.assertIs(context.solve(func),snapshot)
+        limited,scope,result = self._solve("return\nmarker=int",limits={"steps":1})
+        for query in (result.must_execute,result.target_unreachable):
+            answer = query(scope.body[1])
+            self.assertFalse(answer.complete)
+            self.assertFalse(answer)
+
+    def test_route_break_skips_else_and_records_the_loop_destination(self):
+        context,func,snapshot = self._solve("for x in iter(int,1):\n    break\nelse:\n    skipped=int\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        loop = func.body[0]
+        for event in ((loop,"next"),(loop.target,"after"),(loop.body[0],"transfer"),
+                (loop,"after"),func.body[1]):
+            self.assertTrue(snapshot.must_execute(event))
+        self.assertTrue(snapshot.target_unreachable(loop.orelse[0]))
+
+    def test_route_first_operand_failure_prevents_later_cause_and_transfer(self):
+        for source in ("return int(missing)","raise ValueError(missing) from int('bad')"):
+            context,func,snapshot = self._solve(source)
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            statement = func.body[0]
+            self.assertTrue(snapshot.must_execute(statement))
+            self.assertTrue(snapshot.target_unreachable((statement,"transfer")))
+            if isinstance(statement,ast.Raise):
+                self.assertTrue(snapshot.target_unreachable(statement.cause))
+        context,func,snapshot = self._solve("assert False,missing")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        assertion = func.body[0]
+        self.assertEqual(bool(snapshot.must_execute(assertion.test)),not bool(sys.flags.optimize))
+        self.assertEqual(bool(snapshot.must_execute(assertion.msg)),not bool(sys.flags.optimize))
+        self.assertEqual(bool(snapshot.must_execute((assertion,"after"))),bool(sys.flags.optimize))
+
+    def test_route_acquired_manager_prefix_unwinds_without_entering_failed_item(self):
+        context,func,snapshot = self._solve("import contextlib\ntry:\n    with contextlib.suppress(ValueError),missing:\n        skipped=int\nexcept NameError:\n    marker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        first,second = func.body[1].body[0].items
+        for role in ("entry","exit"):
+            self.assertTrue(snapshot.must_execute((first,role)))
+            self.assertTrue(snapshot.target_unreachable((second,role)))
+        self.assertTrue(snapshot.must_execute(func.body[1].handlers[0].body[0]))
+
+    def test_route_star_headers_validate_even_when_no_residual_enters_later_body(self):
+        context,func,snapshot = self._solve("try:\n    raise ExceptionGroup('g',[ValueError()])\nexcept* ValueError:\n    marker=int\nexcept* TypeError:\n    skipped=int\nafter=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        first,second = func.body[0].handlers
+        for event in ((first,"before"),(first,"entry"),first.body[0],(second,"before"),func.body[1]):
+            self.assertTrue(snapshot.must_execute(event))
+        self.assertTrue(snapshot.target_unreachable((second,"entry")))
+        self.assertTrue(snapshot.target_unreachable(second.body[0]))
+
+    def test_route_foreign_selector_callbacks_are_rejected_before_comparison(self):
+        context,func,snapshot = self._solve("marker=int")
+        marker = func.body[0]
+        calls = []
+        class Foreign:
+            def __eq__(self,other):
+                calls.append(other)
+                raise RuntimeError("foreign comparison")
+        class ForeignRole(str):
+            __eq__ = Foreign.__eq__
+        for event,kwargs in (((marker,ForeignRole("before")),{}),(marker,{"continuation":(Foreign(),)}),
+                (marker,{"region":Foreign()}),(marker,{"incoming":(Foreign(),)})):
+            answer = snapshot.target_unreachable(event,**kwargs)
+            self.assertFalse(answer.complete)
+            self.assertFalse(answer)
+        self.assertFalse(calls)
+
+    def test_route_unobserved_shared_control_dag_is_rejected_before_state_hashing(self):
+        context,func,snapshot = self._solve("marker=int")
+        entry = snapshot.states_at(func,"entry")[0]
+        dag = "ValueError"
+        for unused in range(20):
+            dag = (dag,dag)
+        bad = _ProofState(epoch=entry.epoch,active=(("error",dag),))
+        self.assertFalse(context._entry_control_shape(bad))
+        hashed = []
+        original = _ProofState.__hash__
+        def guarded(state):
+            if state is bad:
+                hashed.append(1)
+                return 0  # Avoid expanding the forbidden DAG in this test.
+            return original(state)
+        with mock.patch.object(_ProofState,"__hash__",guarded):
+            for query in (snapshot.must_execute,snapshot.target_unreachable):
+                result = query(func.body[0],incoming=bad)
+                self.assertFalse(result.complete)
+                self.assertFalse(result)
+        self.assertFalse(hashed,"unobserved state was fully hashed before rejection")
+        self.assertTrue(snapshot.must_execute(func.body[0],incoming=(entry,entry)))
+        self.assertFalse(snapshot.must_execute(func.body[0],incoming=replace(entry)).complete)
+
+    def test_route_public_divergence_records_preserve_and_join_scope_visit_histories(self):
+        for repeated in (False,True):
+            body = "print('ok')" if not repeated else "try:\n    print('first')\nexcept:\n    pass\nprint('second')"
+            context,func,snapshot = self._solve(body,diagnostic_policy=("print",))
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            call = func.body[0].value if not repeated else func.body[1].value
+            site = context.index.node_id(call)
+            records = [item for item in snapshot.observations if item.observation[1]==site]
+            self.assertEqual(len(records),1)
+            bit = 1<<context.index.event_id(call,"invoke")[1]
+            self.assertTrue(records[0].visits.must & bit)
+            if repeated:
+                first = func.body[0].body[0].value
+                after = 1<<context.index.event_id(first,"after")[1]
+                handler = 1<<context.index.event_id(func.body[0].handlers[0].body[0],"before")[1]
+                self.assertTrue(records[0].visits.may & after)
+                self.assertFalse(records[0].visits.must & after)
+                self.assertTrue(records[0].visits.may & handler)
+                self.assertFalse(records[0].visits.must & handler)
+
     def test_visit_structural_slice_cannot_gain_legacy_unreachable_proof(self):
         context,func,snapshot = self._solve("x=[1][:]\nreturn\nmarker=int")
         self.assertTrue(snapshot.complete,snapshot.reasons)
@@ -27269,7 +27676,7 @@ class ProofFlowTests(unittest.TestCase):
         wide,scope,result = self._solve("int('7')\nreturn\n"+"pass\n"*100)
         self.assertTrue(result.complete,result.reasons)
         self.assertGreater(result.stats["visit_work"],snapshot.stats["visit_work"])
-        self.assertFalse(result.trace_complete)
+        self.assertTrue(result.trace_complete)
 
     def test_visit_index_assigns_legal_roles_independently_of_actual_visitation(self):
         context,func,snapshot = self._solve("int(missing)\nmarker=int")
@@ -27351,7 +27758,7 @@ class ProofFlowTests(unittest.TestCase):
                 (target.value,"before",True),(target.slice,"after",True),(statement.value,"before",False)):
             number = context.index.event_id(node,role)[1]
             self.assertEqual(bool(item.visits.must & (1<<number)),want)
-        self.assertFalse(getattr(snapshot,"trace_complete",False))
+        self.assertTrue(snapshot.trace_complete)
 
     def test_quiet_query_collection_writes_and_deletes_are_observable(self):
         for write in ("x[0]=2","del x[0]","x[:]=[2]","del x[:]"):
@@ -30555,8 +30962,8 @@ class ProofFlowTests(unittest.TestCase):
 
     def test_incoming_collection_validation_shares_aggregate_work_budget(self):
         source = "def f(x,y):\n    pass\nfirst=(1,2)\nsecond=(3,4)\n"
-        # Prior51 + suite origin2*7 + phase entry/exit2 =67.
-        for limit, complete in ((3, False), (66, False), (67, True), (68, True)):
+        # Prior67 + three region-entry facts +74 charged route/visit work =144.
+        for limit, complete in ((3, False), (143, False), (144, True), (145, True)):
             with self.subTest(limit=limit):
                 context = _ProofContext(source, limits={"steps": limit})
                 func = context.tree.body[0]
@@ -30576,8 +30983,8 @@ class ProofFlowTests(unittest.TestCase):
         for copied in (False, True):
             for duplicate in (False, True):
                 with self.subTest(copied=copied, duplicate=duplicate):
-                    # Prior48 + suite origin2*7 + phase entry/exit2 =64.
-                    context = _ProofContext("def f(x,y):\n    pass\nshape=(1,2)\n", limits={"steps": 64})
+                    # Prior64 + three region-entry facts +74 route/visit work.
+                    context = _ProofContext("def f(x,y):\n    pass\nshape=(1,2)\n", limits={"steps": 141})
                     func = context.tree.body[0]
                     site = context.index.node_id(context.tree.body[1].value)
                     token = ("sequence", "tuple", site, (_ProofValue.literal(1).atoms, _ProofValue.literal(2).atoms), 3, 1)
@@ -30591,8 +30998,8 @@ class ProofFlowTests(unittest.TestCase):
                     self.assertTrue(snapshot.complete, snapshot.reasons)
 
     def test_collection_entry_cache_reuses_validated_whole_state(self):
-        # Prior30 + suite origin2*4 + phase entry/exit2 =40.
-        context = _ProofContext("def f(x):\n    pass\nshape=(1,2)\n", limits={"steps": 40})
+        # Prior40 + three region-entry facts +74 route/visit work =117.
+        context = _ProofContext("def f(x):\n    pass\nshape=(1,2)\n", limits={"steps": 117})
         func = context.tree.body[0]
         token = ("sequence", "tuple", context.index.node_id(context.tree.body[1].value),
                  (_ProofValue.literal(1).atoms, _ProofValue.literal(2).atoms), 3, 1)
@@ -31214,8 +31621,8 @@ class ProofStateTests(unittest.TestCase):
         self.assertEqual(state.active, (("error", "LookupError"),))
 
     def test_work_budget_boundary_never_proves_unreachable(self):
-        # Prior9 + suite origin2 + phase entry/exit2 =13.
-        for limit, want in ((12, False), (13, True), (14, True)):
+        # Prior13 + three region-entry facts +74 route/visit work =90.
+        for limit, want in ((89, False), (90, True), (91, True)):
             with self.subTest(limit=limit):
                 context = self._context("def f():\n    pass\n", limits={"steps": limit})
                 func = context.tree.body[0]
@@ -31296,8 +31703,8 @@ class ProofStateTests(unittest.TestCase):
                          _ProofValue.literal(0))
 
     def test_exact_state_and_alternative_boundaries_include_scope_entry(self):
-        # Entry + AST origin + suite origin + scope output alternative =4.
-        for cap, complete in ((3, False), (4, True), (5, True)):
+        # Prior4 + scope-exit event +4 queue keys/4 local trace slots =13.
+        for cap, complete in ((12, False), (13, True), (14, True)):
             with self.subTest(state_cap=cap):
                 snapshot = self._context("", limits={"states": cap}).solve()
                 self.assertEqual(snapshot.complete, complete)
@@ -31355,8 +31762,8 @@ class ProofStateTests(unittest.TestCase):
 
     def test_independent_query_order_and_cache_eviction_keep_results_intrinsic(self):
         source = "def f():\n    pass\ndef g():\n    pass\n"
-        left = self._context(source, limits={"steps": 13, "contexts": 0})
-        right = self._context(source, limits={"steps": 13, "contexts": 0})
+        left = self._context(source, limits={"steps": 90, "contexts": 0})
+        right = self._context(source, limits={"steps": 90, "contexts": 0})
         left_results = [left.solve(scope) for scope in left.tree.body]
         right_results = [right.solve(scope) for scope in reversed(right.tree.body)]
         for first, second in zip(left_results, reversed(right_results)):
@@ -31366,7 +31773,7 @@ class ProofStateTests(unittest.TestCase):
         evicted = left.solve(left.tree.body[0])
         self.assertEqual(evicted.stats, left_results[0].stats)
         self.assertEqual(evicted.reasons, left_results[0].reasons)
-        self.assertEqual(left.total_compute["steps"], 39)
+        self.assertEqual(left.total_compute["steps"], 270)
         self.assertEqual(len(left._cache), 1)
 
     def test_incoming_frames_names_and_binding_owners_obey_bounds(self):
