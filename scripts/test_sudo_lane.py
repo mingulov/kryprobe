@@ -4409,6 +4409,13 @@ class _ProofScopeIndex:
             if outer is not None:
                 static_attributes[outer].add(node.attr)
         self._static_attributes = MappingProxyType({owner:tuple(sorted(names)) for owner,names in static_attributes.items()})
+        classdict_needed = set()
+        if self.semantic_key[:2]>=(3,14) and not future:
+            for node in nodes.values():
+                if (isinstance(node,ast.AnnAssign) or isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef))
+                        and _def_annotations(node)) and isinstance(owners[id(node)],ast.ClassDef):
+                    classdict_needed.add(owners[id(node)])
+        self._classdict_needed = frozenset(classdict_needed)
         captures = {owner: set() for owner in local}
         cells = {owner: set() for owner in local}
         references = [(owners[id(node)], node.id) for node in ast.walk(tree)
@@ -8782,6 +8789,18 @@ class _ProofContext:
                 self._check_alias_budget(current,stats)
             return current
 
+        def check_class_annotation_epilogue(node,current):
+            if current.pending.kind!="normal" or not isinstance(node,ast.ClassDef):
+                return
+            if self.semantic_key[1][:2]>=(3,14) and not self._future \
+                    and any(isinstance(item.target,ast.Name) and item.simple for item in self._class_annotations[node]):
+                raise _ProofIncomplete("unsupported-class-annotation-function")
+            if node in self.index._classdict_needed \
+                    and "__classdictcell__" in (self.index.globals_for(node)|self.index.nonlocals_for(node)):
+                # Neither nested nor standalone scope exits may omit this
+                # required compiler write and then prove the export absent.
+                raise _ProofIncomplete("unsupported-class-annotation-cell")
+
         def annotation_mapping(current):
             # The compiler emits LOAD_NAME here, even when a declaration makes
             # ordinary source reads of __annotations__ global/nonlocal.
@@ -8888,8 +8907,12 @@ class _ProofContext:
                 raise _ProofIncomplete("alias-budget")
             selected = _ProofEffects.region_value(self.index, scope, current, ("globals", 0), "__builtins__")
             if selected == _ProofValue.absent():
-                selected = _ProofValue.unknown_value("entry-frame-builtins") if "frame-builtins-open" in current.entry_modes \
-                    else _ProofEffects.namespace("mapping", ("builtins", 0))
+                if current_frame is not None:
+                    self._charge(stats,len(current.regions))
+                    selected = current.region_value(("function",owner),"$builtins")
+                else:
+                    selected = _ProofValue.unknown_value("entry-frame-builtins") if "frame-builtins-open" in current.entry_modes \
+                        else _ProofEffects.namespace("mapping", ("builtins", 0))
             regions = {atom[2] for atom in selected.atoms if len(atom) == 3 and atom[0] == "namespace"
                        and atom[1] in ("module", "mapping")}
             if not selected.unknown and len(regions) == 1 and all(len(atom) == 3 and atom[0] == "namespace"
@@ -9474,6 +9497,7 @@ class _ProofContext:
                 enqueue(cursor, outcome.state, outcome.observation, outcome.visits)
 
             def terminal(state):
+                check_class_annotation_epilogue(root_scope,state)
                 # Coroutine escape converts StopIteration after all in-frame
                 # handlers/finally. Interior handlers must still see the
                 # original exception. Generator resumption is not modeled.
@@ -9518,10 +9542,20 @@ class _ProofContext:
                        |{name for name,value in self._class_entry_defaults[scope]})>self.limits["names"]:
                     raise _ProofIncomplete("name-budget")
                 selected = state.region_value(("function",site),"$builtins")
-                module = _ProofEffects.region_value(self.index,scope,state,("globals",0),"__name__")
-                if module==_ProofValue.absent():
-                    module = _ProofEffects.captured_builtin(self.index,scope,state,selected,"__name__")
-                if module==_ProofValue.absent():
+                if "__name__" in self.index._captures[scope]:
+                    # The implicit load follows the compiler-selected symbol
+                    # scope; it does not itself create an enclosing capture.
+                    self._charge(stats,1+len(state.bindings)+2*len(state.regions)
+                                 +len(self.index._function_cells[scope]))
+                    module,error = _ProofEffects.lookup(self.index,scope,state,"__name__",
+                        selected_builtins=selected,native_class=True,
+                        live_owners=(self.index.node_id(root_scope),))
+                else:
+                    module = _ProofEffects.region_value(self.index,scope,state,("globals",0),"__name__")
+                    if module==_ProofValue.absent():
+                        module = _ProofEffects.captured_builtin(self.index,scope,state,selected,"__name__")
+                    error = "NameError" if module==_ProofValue.absent() else None
+                if error is not None:
                     state = self._implicit_error(scope,"NameError",state,stats,
                         fields=(("name",_ProofValue.literal("__name__")),))
                     enqueue(cursor,state)
@@ -9540,10 +9574,7 @@ class _ProofContext:
                     raise _ProofIncomplete("class-frame-unwind")
                 if state.pending.kind not in ("normal","raise"):
                     raise _ProofIncomplete("cross-class-transfer")
-                if state.pending.kind=="normal" and self.semantic_key[1][:2]>=(3,14) \
-                        and not self._future \
-                        and any(isinstance(item.target,ast.Name) and item.simple for item in self._class_annotations[scope]):
-                    raise _ProofIncomplete("unsupported-class-annotation-function")
+                check_class_annotation_epilogue(scope,state)
                 if state.pending.kind=="normal" and self.semantic_key[1][:2]>=(3,13):
                     names = self.index._static_attributes[scope]
                     self._charge(stats,1+len(names))
@@ -28707,6 +28738,63 @@ class ProofFlowTests(unittest.TestCase):
         self.assertEqual(result.exits[0].lookup(owner,"marker"),_ProofValue(frozenset({("native","int")})))
         self.assertEqual(result.exits[0].lookup(owner,"module"),_ProofValue.literal("changed"))
 
+    def test_eager_class_nested_callable_fallback_uses_actual_frame(self):
+        for declaration in ("reader=lambda ignored:int","def reader(ignored):\n    return int"):
+            for action,selected in (("del __builtins__","replacement"),("pass","replacement"),
+                                    ("__builtins__=later","later")):
+                with self.subTest(declaration=declaration,action=action):
+                    body = ('global __builtins__\nreplacement={}\nreplacement["int"]=object\n'
+                        'later={}\nlater["int"]=int\n__builtins__=replacement\nclass C:\n'
+                        '    global __builtins__\n    '+action+'\n'
+                        +''.join('    '+line+'\n' for line in declaration.splitlines())+'marker=C.reader')
+                    context,scope,result = self._class_header_solve(body)
+                    self.assertTrue(result.complete,result.reasons)
+                    state = result.exits[0]
+                    owner = context.index.node_id(scope)
+                    cls = next(node for node in scope.body if isinstance(node,ast.ClassDef))
+                    reader = next(node for node in ast.walk(cls) if isinstance(node,(ast.Lambda,ast.FunctionDef)))
+                    self.assertEqual(state.region_value(("function",context.index.node_id(reader)),"$builtins"),
+                                     state.lookup(owner,selected))
+                    if action=="del __builtins__" and isinstance(reader,ast.Lambda):
+                        cost = result.stats["steps"]
+                        for cap,want in ((cost-1,False),(cost,True),(cost+1,True)):
+                            limited,func,outcome = self._class_header_solve(body,limits={"steps":cap})
+                            self.assertEqual(outcome.complete,want,outcome.reasons)
+                            if not want:
+                                self.assertIn("work-budget",outcome.reasons)
+                                self.assertFalse(outcome.target_unreachable(func.body[-1]))
+
+    def test_eager_class_decorator_fallback_does_not_publish_false_dead_branch(self):
+        context,scope,result=self._class_header_solve('global __builtins__\nreplacement={}\nreplacement["int"]=object\n__builtins__=replacement\nclass C:\n    global __builtins__\n    del __builtins__\n    reader=lambda ignored:int\n@C.reader\nclass D:\n    value=1\nif D is object:\n    marker=1\nelse:\n    marker=2\nreturn marker')
+        self.assertTrue(result.complete,result.reasons)
+        branch=scope.body[-2]
+        self.assertEqual(result.exits[0].pending.value,_ProofValue.literal(1))
+        self.assertTrue(result.must_execute(branch.body[0]))
+        self.assertFalse(result.target_unreachable(branch.body[0]))
+
+    def test_eager_class_nested_class_function_uses_actual_frame(self):
+        context,scope,result=self._class_header_solve('global __builtins__\nreplacement={}\nreplacement["int"]=object\nreplacement["__build_class__"]=__build_class__\n__builtins__=replacement\nclass C:\n    global __builtins__\n    del __builtins__\n    class D:\n        value=int\nmarker=C.D.value')
+        self.assertTrue(result.complete,result.reasons)
+        self.assertEqual(result.exits[0].lookup(context.index.node_id(scope),"marker"),_ProofValue(frozenset({("native","object")})))
+
+    def test_eager_class_module_prologue_uses_compiler_selected_name_scope(self):
+        for classbody,want in (("value=1",False),("nonlocal __name__\nvalue=1",True),("value=__name__",True),("def reader():\n    return __name__",True),("__name__=object\ndef reader():\n    return __name__",False)):
+            with self.subTest(classbody=classbody):
+                body="__name__=int\nclass C:\n"+"".join("    "+line+"\n" for line in classbody.splitlines())+"if C.__module__ is int:\n    marker=1\nelse:\n    marker=2\nreturn marker"
+                context,scope,result=self._class_header_solve(body)
+                self.assertTrue(result.complete,result.reasons)
+                branch=scope.body[-2]
+                self.assertEqual(result.exits[0].pending.value,_ProofValue.literal(1 if want else 2))
+                self.assertEqual(bool(result.must_execute(branch.body[0])),want)
+                self.assertEqual(bool(result.target_unreachable(branch.body[0])),not want)
+
+    def test_eager_class_module_prologue_empty_nonlocal_name_errors_before_body(self):
+        context,scope,result=self._class_header_solve('__name__=int\ndel __name__\ntry:\n    class C:\n        nonlocal __name__\n        value=1\nexcept NameError:\n    marker=1\nelse:\n    marker=2\nreturn marker')
+        self.assertTrue(result.complete,result.reasons)
+        self.assertEqual(result.exits[0].pending.value,_ProofValue.literal(1))
+        cls=scope.body[2].body[0]
+        self.assertTrue(result.target_unreachable(cls.body[-1]))
+
     def test_eager_class_failed_namespace_releases_are_checked(self):
         for keep in (False,True):
             prefix = "keep=x\n" if keep else ""
@@ -28940,6 +29028,33 @@ class ProofFlowTests(unittest.TestCase):
         else:
             self.assertEqual(result.exits[0].lookup(context.index.node_id(func),"item"),_ProofValue.literal("x"))
             self.assertTrue(result.must_execute(func.body[-1]))
+
+    def test_eager_class_unmodeled_redirected_classdict_export_cannot_prove_a_missing_global(self):
+        for declaration in ("mapping[0]:int","def method(value:int):\n    pass"):
+            body = "mapping={}\nclass C:\n    global __classdictcell__\n"+"".join(
+                "    "+line+"\n" for line in declaration.splitlines())+"saved=__classdictcell__\nmarker=int"
+            with self.subTest(declaration=declaration):
+                context,func,result = self._class_header_solve(body,semantic_key=(3,14))
+                self.assertFalse(result.complete)
+                self.assertIn("unsupported-class-annotation-cell",result.reasons)
+                self.assertFalse(result.target_unreachable(func.body[-1]))
+
+    def test_eager_class_standalone_exit_also_declines_an_unmodeled_hidden_export(self):
+        context = _ProofContext("class C:\n    global __classdictcell__\n    mapping={}\n    mapping[0]:int\n",
+            semantic_key=(3,14))
+        cls = context.tree.body[0]
+        seed = _ProofState().bind(0,"__classdictcell__",_ProofValue.absent())
+        result = context.solve(cls,entry=(seed,))
+        self.assertFalse(result.complete)
+        self.assertIn("unsupported-class-annotation-cell",result.reasons)
+
+    def test_eager_class_standalone_exit_does_not_skip_a_required_annotation_function(self):
+        context = _ProofContext("class C:\n    global __annotate_func__\n    value:int\n",semantic_key=(3,14))
+        cls = context.tree.body[0]
+        seed = _ProofState().bind(0,"__annotate_func__",_ProofValue.absent())
+        result = context.solve(cls,entry=(seed,))
+        self.assertFalse(result.complete)
+        self.assertIn("unsupported-class-annotation-function",result.reasons)
 
     def test_eager_class_future_annotations_create_the_map_without_evaluating_names(self):
         for version in ((3,12),(3,14)):
