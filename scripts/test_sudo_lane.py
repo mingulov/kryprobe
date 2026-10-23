@@ -6976,6 +6976,14 @@ class _ProofContext:
                 if state.temporaries:
                     reasons.append("foreign-temporary-entry")
                     return snapshot()
+                if state.region_defined(("contextlib", 0), "suppress") \
+                        and state.region_value(("contextlib", 0), "suppress") != _ProofValue(frozenset({_ProofEffects._suppress_class})) \
+                        and any(region == ("suppress-class", 0) for region, name, value in state.regions):
+                    # Class fields are borrowed through the authentic module
+                    # binding. An explicit contrary entry cannot silently keep
+                    # a retired heap class and its opaque members alive.
+                    reasons.append("unsupported-retired-suppress-class-entry")
+                    return snapshot()
                 if state.context_depth() > self.limits["contexts"]:
                     reasons.append("context-budget")
                     return snapshot()
@@ -27084,6 +27092,23 @@ class ProofFlowTests(unittest.TestCase):
         for name in ("path","message"):
             self.assertEqual(_ProofEffects.single(state.lookup(owner,name))[0],"plain-string")
         self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_retired_suppress_class_hook_entries_cannot_invent_permanent_borrowed_roots(self):
+        context = _ProofContext("def f(old,x):\n    x=0\n    old=0\n    marker=int\n")
+        func = context.tree.body[0]
+        owner = context.index.node_id(func)
+        genuine = _ProofValue(frozenset({_ProofEffects._suppress_class}))
+        x = _ProofValue(frozenset({("opaque","parameter",owner,"x")}))
+        base = _ProofState().bind(owner,"old",genuine).bind(owner,"x",x)
+        base = base.write_region(("suppress-class",0),"__exit__",x)
+        for module_value,complete in ((genuine,True),(_ProofValue.absent(),False),(_ProofValue.literal(0),False)):
+            with self.subTest(module_value=module_value):
+                seed = base.write_region(("contextlib",0),"suppress",module_value)
+                result = context.solve(func,entry=(seed,))
+                self.assertEqual(result.complete,complete,result.reasons)
+                self.assertEqual(result.native_identity(func.body[-1].value,"int"),complete)
+                if not complete:
+                    self.assertIn("unsupported-retired-suppress-class-entry",result.reasons)
 
     def test_type_union_creation_flattens_preserves_order_and_saved_classes(self):
         context,func,snapshot = self._solve("global OSError\nsaved=OSError\nu=(ValueError|IOError)|(TypeError|ValueError)\n"
