@@ -4780,11 +4780,11 @@ class _ProofState:
             + [value for region, name, value in self.regions] + list(self.temporaries)
         if self.pending.value is not None:
             values.append(self.pending.value)
-        count = len(self.borrowed_exceptions) + sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method")
+        count = len(self.borrowed_exceptions) + sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method", "type-union")
                                                  for value in values for atom in value.atoms)
         for frame in self.continuation:
             if frame and frame[0] == "finally" and frame[2][3] is not None:
-                count += sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method") for atom in frame[2][3][0])
+                count += sum(atom[0] in ("namespace", "exception", "sequence", "collection", "exception-method", "type-union") for atom in frame[2][3][0])
                 values.append(_ProofValue(*frame[2][3]))
         error_roots = [self.pending.error, self.active, self.managers]
         for frame in self.continuation:
@@ -4804,16 +4804,21 @@ class _ProofState:
                 error_roots.extend(part)
         pending = [value.atoms for value in values]
         pending.extend(value.atoms for item in self.exception_objects for value in item.values())
+        pending.extend(value.atoms for item in self.collection_objects for value in item.items)
         # A method descriptor captures its receiver. No method-object identity
         # is inferred from this structural value; charge its node/edge at
         # every stored occurrence (copies conservatively over-account).
-        method_values = values + [value for item in self.exception_objects for value in item.values()] \
-            + [value for item in self.collection_objects for value in item.items]
-        count += 2 * sum(atom[0] == "exception-method" for value in method_values for atom in value.atoms)
+        # Closed native unions retain only immortal classes. Represent the
+        # union node, its args edge/tuple and ordered member edges; as with
+        # method descriptors, copies conservatively charge each occurrence.
         collections = set()
         while pending:
             atoms = pending.pop()
             for atom in atoms:
+                count += 2 * (atom[0] == "exception-method")
+                members = _ProofEffects.union_types(atom)
+                if members is not None:
+                    count += 3 + len(members)
                 shape = _ProofEffects.sequence_shape(atom)
                 if shape is not None and atom not in collections:
                     collections.add(atom)
@@ -4915,7 +4920,7 @@ class _ProofEffects:
                     raise _ProofIncomplete("unsupported-exception-construction")
                 return ("native-exception", name, site), None
             return None, "TypeError"
-        if token and token[0] in ("literal", "singleton", "namespace", "plain-object", "plain-string", "const-callable"):
+        if token and token[0] in ("literal", "singleton", "namespace", "plain-object", "plain-string", "const-callable", "type-union"):
             return None, "TypeError"
         raise _ProofIncomplete("opaque-raised-value")
 
@@ -4963,7 +4968,65 @@ class _ProofEffects:
             return token == ("singleton", "Ellipsis")
         if token[0] == "plain-string":
             return len(token) == 2 and type(token[1]) is int
+        if token[0] == "type-union":
+            return cls.union_types(token) is not None
         return len(token) == 2 and token[0] == "exception" and cls.exception_name(token[1]) is not None
+
+    @classmethod
+    def union_types(cls, token):
+        """Flat closed descriptor; native class identities, never user hooks."""
+        if type(token) is not tuple or len(token) != 3 or type(token[0]) is not str or token[0] != "type-union" \
+                or type(token[1]) is not int or token[1] < 0 or type(token[2]) is not tuple \
+                or not 2 <= len(token[2]) <= len(cls._builtin_types) + 1 \
+                or any(type(name) is not str for name in token[2]):
+            return None
+        names = token[2]
+        if len(set(names)) != len(names) or any(name not in cls._builtin_types and name != "NoneType" for name in names) \
+                or any(cls._exception_mros.get(name, (name,))[0] != name for name in names):
+            return None
+        return names
+
+    @classmethod
+    def bitwise_or(cls, left, right, site, version, state, charge, limits):
+        tokens = cls.single(left), cls.single(right)
+        if any(token is None for token in tokens):
+            raise _ProofIncomplete("opaque-bitwise-protocol")
+        if any(token[0] == "native" and (len(token) != 2 or type(token[1]) is not str
+                or token[1] not in cls._builtin_names) for token in tokens):
+            raise _ProofIncomplete("unsupported-native-operand")
+        # The entry contract also admits these legacy builtin tokens. Their
+        # runtime objects are the same singletons as ordinary literal loads.
+        singletons = {"True": True, "False": False, "None": None}
+        tokens = tuple(cls.single(_ProofValue.literal(singletons[token[1]]))
+                       if token[0] == "native" and token[1] in singletons else token for token in tokens)
+        if all(token[:2] in (("literal", "int"), ("literal", "bool")) for token in tokens):
+            charge(1 + max(token[2].bit_length() for token in tokens) // 30)
+            return _ProofValue.literal(tokens[0][2] | tokens[1][2]), None
+        def members(token):
+            if token[0] == "native" and token[1] in cls._builtin_types:
+                return (cls._exception_mros.get(token[1], (token[1],))[0],)
+            if token == ("literal", "NoneType", None):
+                return ("NoneType",)
+            return cls.union_types(token)
+        parts = tuple(members(token) for token in tokens)
+        charge(1 + sum(len(part) if part is not None else 1 for part in parts))
+        if any(part is None for part in parts):
+            # 3.14 Union's own nb_or calls typing._type_check on arbitrary
+            # inputs (including literals); it is not type's unchecked slot.
+            if version[:2] == (3, 14) and any(token[0] == "type-union" for token in tokens):
+                raise _ProofIncomplete("typing-union-protocol")
+            if not all(cls.closed_leaf(token) for token in tokens):
+                raise _ProofIncomplete("opaque-bitwise-protocol")
+            return None, "TypeError"
+        if all(token == ("literal", "NoneType", None) for token in tokens):
+            return None, "TypeError"  # Neither None operand supplies an OR slot.
+        names = tuple(dict.fromkeys(parts[0] + parts[1]))
+        if len(names) == 1:
+            return _ProofValue(frozenset({("native", names[0])})), None
+        charge(1 + len(names))
+        if state.alias_count() + 4 + len(names) > limits["aliases"]:
+            raise _ProofIncomplete("alias-budget")
+        return _ProofValue(frozenset({("type-union", site, names)})), None
 
     @classmethod
     def closed_value(cls, value):
@@ -5128,6 +5191,47 @@ class _ProofEffects:
         return tuple(values)
 
     @classmethod
+    def value_work(cls, value):
+        # Alternatives/Unknown affect precision, not occupied storage. Every
+        # stored atom remains part of graph traversal and must be reserved.
+        return sum(cls._atom_work(token) for token in value.atoms) or 1
+
+    @classmethod
+    def _atom_work(cls, token):
+        shape = cls.sequence_shape(token)
+        if shape is None:
+            union = cls.union_types(token)
+            return 3 + len(union) if union is not None else 1
+        # Legacy size already bills primitive leaves. Add the descriptor
+        # slots those leaves now contain. Compute over the compact host DAG,
+        # then sum per ordered semantic occurrence: sharing/copying yields
+        # the same result without expanding repeated-child paths.
+        extra = {}
+        pending = [(token, False)]
+        while pending:
+            current, ready = pending.pop()
+            key = id(current)
+            if key in extra:
+                continue
+            union = cls.union_types(current)
+            if union is not None:
+                extra[key] = 2 + len(union)  # Replace one leaf with 3+n slots.
+                continue
+            nested = cls.sequence_shape(current)
+            if nested is None:
+                extra[key] = 0
+                continue
+            if any(type(child) is not frozenset or len(child) != 1 for child in nested[0]):
+                return shape[1]  # Ordinary entry validation rejects this shape.
+            children = tuple(next(iter(child)) for child in nested[0])
+            if ready:
+                extra[key] = sum(extra[id(child)] for child in children)
+            else:
+                pending.append((current, True))
+                pending.extend((child, False) for child in children if id(child) not in extra)
+        return shape[1] + extra[id(token)]
+
+    @classmethod
     def exception_work(cls, state, extra=()):
         values = list(cls.exception_values(state)) + list(extra)
         count = 1 + len(state.active) + len(state.managers) + len(state.continuation)
@@ -5141,8 +5245,7 @@ class _ProofEffects:
             values.extend(item.items)
         values.extend(value for region, name, value in state.regions if region[0] not in ("globals", "builtins"))
         for value in values:
-            shape = cls.sequence_shape(cls.single(value))
-            count += shape[1] if shape is not None else 1
+            count += cls.value_work(value)
         return count
 
     @classmethod
@@ -5635,7 +5738,7 @@ class _ProofEffects:
                     return None, "TypeError"
                 candidates.append(cls._exception_mros[member[1]][0])
             elif member and member[0] in ("literal", "singleton", "namespace", "plain-object", "plain-string",
-                                        "const-callable", "exception", "exception-types", "sequence", "collection"):
+                                        "const-callable", "exception", "exception-types", "sequence", "collection", "type-union"):
                 return None, "TypeError"
             else:
                 raise _ProofIncomplete("opaque-handler-type")
@@ -6599,6 +6702,8 @@ class _ProofContext:
             return ("TypeError", "RuntimeError")
         if isinstance(node, (ast.UnaryOp, ast.ExceptHandler)):
             return ("TypeError",)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            return ("TypeError",)
         if isinstance(node, ast.FormattedValue):
             return ("ValueError",)
         if isinstance(node, ast.AsyncFunctionDef):
@@ -6904,6 +7009,23 @@ class _ProofContext:
                         reasons.append("unsupported-composite-entry")
                         return snapshot()
                     for atom in atoms:
+                        if atom[0] == "type-union":
+                            members = _ProofEffects.union_types(atom)
+                            if members is None:
+                                reasons.append("unsupported-union-entry")
+                                return snapshot()
+                            try:
+                                allocation = self.index.node_for_id(atom[1])
+                            except (IndexError, KeyError):
+                                allocation = None
+                            if not isinstance(allocation, ast.BinOp) or not isinstance(allocation.op, ast.BitOr):
+                                reasons.append("unsupported-union-entry")
+                                return snapshot()
+                            try:
+                                self._charge(stats, 3 + len(members))
+                            except _ProofIncomplete as error:
+                                reasons.append(str(error))
+                                return snapshot()
                         if atom[0] == "exception-method" and (len(atom) != 3 or atom[2] not in ("split", "subgroup")
                                 or (receiver := state.exception_object(atom[1])) is None or not receiver.children):
                             reasons.append("unowned-group-method-entry")
@@ -7249,7 +7371,7 @@ class _ProofContext:
             elif token == ("native", "__import__") and len(arguments) == 1 and not keywords \
                     and arguments[0] == _ProofValue.literal("builtins"):
                 result = _ProofEffects.namespace("module", ("builtins", 0))
-            elif token is not None and token[0] == "literal":
+            elif token is not None and token[0] in ("literal", "type-union"):
                 error = "TypeError"
             else:
                 raise _ProofIncomplete("unsupported-call" if token and token[0] == "native"
@@ -7331,6 +7453,14 @@ class _ProofContext:
                     else:
                         number = (1 if token[2] else 0) if token[1] == "bool" else token[2]
                         results.extend(finish(node, _ProofValue.literal(-number if isinstance(node.op, ast.USub) else number), outcome.state))
+                return bounded(results, node)
+            elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+                frontier, abrupt = operands((node.left, node.right), state)
+                results = list(abrupt)
+                for values, current in frontier:
+                    result, error = _ProofEffects.bitwise_or(*values, self.index.node_id(node),
+                        self._native_profile[0], current, lambda amount: self._charge(stats, amount), self.limits)
+                    results.extend(finish(node, result, current, error))
                 return bounded(results, node)
             elif isinstance(node, ast.Compare) and all(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops):
                 frontier, results = [], []
@@ -26303,6 +26433,296 @@ class ProofFlowTests(unittest.TestCase):
         context = _ProofContext(source, **kwargs)
         func = context.tree.body[0]
         return context, func, context.solve(func, entry=entry)
+
+    def test_type_union_creation_flattens_preserves_order_and_saved_classes(self):
+        context,func,snapshot = self._solve("global OSError\nsaved=OSError\nu=(ValueError|IOError)|(TypeError|ValueError)\n"
+            "OSError=0\nv=u|None\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        owner = context.index.node_id(func)
+        u = _ProofEffects.single(state.lookup(owner,"u"))
+        v = _ProofEffects.single(state.lookup(owner,"v"))
+        self.assertEqual(u[0],"type-union")
+        self.assertEqual(u[2],("ValueError","OSError","TypeError"))
+        self.assertEqual(v[2],("ValueError","OSError","TypeError","NoneType"))
+        self.assertEqual(state.lookup(owner,"saved"),_ProofValue(frozenset({("native","OSError")})))
+        self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_type_union_headers_raise_type_error_but_duplicate_alias_collapses_to_class(self):
+        for star in (False,True):
+            for header,kind in (("ValueError|TypeError","TypeError"),("ValueError|None","TypeError"),
+                                ("OSError|IOError",None),("(OSError|IOError,)",None)):
+                with self.subTest(star=star,header=header):
+                    context,func,snapshot = self._solve("try:\n    raise OSError()\nexcept"+
+                        ("*" if star else "")+" "+header+":\n    caught=True\nmarker=int")
+                    self.assertTrue(snapshot.complete,snapshot.reasons)
+                    self.assertEqual(snapshot.exits[0].pending.error_kind,kind)
+                    self.assertEqual(snapshot.unreachable(func.body[0].handlers[0].body[0]),kind is not None)
+                    self.assertEqual(snapshot.native_identity(func.body[-1].value,"int"),kind is None)
+
+    def test_type_union_header_full_operand_order_and_late_star_validation(self):
+        for star in (False,True):
+            for header,kind in (("ValueError|missing","NameError"),("(ValueError|TypeError,missing)","NameError"),
+                    ("(ValueError|0,missing)","TypeError"),("(ValueError|TypeError)|missing","NameError")):
+                with self.subTest(star=star,header=header):
+                    context,func,snapshot = self._solve("try:\n    raise ValueError()\nexcept"+
+                        ("*" if star else "")+" "+header+":\n    pass\nmarker=int")
+                    self.assertTrue(snapshot.complete,snapshot.reasons)
+                    self.assertEqual(snapshot.exits[0].pending.error_kind,kind)
+                    self.assertTrue(snapshot.unreachable(func.body[-1]))
+        context,func,snapshot = self._solve("try:\n    raise ValueError()\nexcept* ValueError as caught:\n"
+            "    saved=caught\nexcept* ValueError|TypeError:\n    pass")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        state = snapshot.exits[0]
+        self.assertEqual(state.pending.error_kind,"TypeError")
+        self.assertEqual(dict(state.exception_object(state.pending.error).fields)["__context__"],
+                         state.lookup(context.index.node_id(func),"saved"))
+
+    def test_type_union_duplicate_group_class_still_obeys_star_group_ban(self):
+        for star in (False,True):
+            context,func,snapshot = self._solve("try:\n    raise ExceptionGroup('g',[ValueError()])\nexcept"+
+                ("*" if star else "")+" ExceptionGroup|ExceptionGroup:\n    caught=True")
+            self.assertTrue(snapshot.complete,snapshot.reasons)
+            self.assertEqual(snapshot.exits[0].pending.error_kind,"TypeError" if star else None)
+
+    def test_bitwise_or_closed_scalars_and_native_nonunionable_errors(self):
+        for expression,expected in (("True|False",True),("True|2",3),("-2|1",-1),("0|0",0)):
+            with self.subTest(expression=expression):
+                context,func,snapshot = self._solve("value="+expression+"\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func),"value"),_ProofValue.literal(expected))
+        for expression in ("None|None","ValueError|0","0|ValueError","None|'x'","len|ValueError","1.0|1"):
+            with self.subTest(expression=expression):
+                context,func,snapshot = self._solve("value="+expression+"\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error_kind,"TypeError")
+                self.assertTrue(snapshot.unreachable(func.body[-1]))
+
+    def test_type_union_unknown_protocol_and_314_typing_fallback_do_not_invent_error(self):
+        for body in ("u=x|ValueError\nmarker=int","u=ValueError|x\nmarker=int"):
+            context,func,snapshot = self._solve(body,parameters="x",entry=(
+                _ProofState().bind(1,"x",_ProofValue(frozenset({("opaque","parameter",1,"x")}))),))
+            self.assertFalse(snapshot.complete)
+            self.assertFalse(snapshot.unreachable(func.body[-1]))
+        for version in ((3,12),(3,14)):
+            context,func,snapshot = self._solve("u=(ValueError|TypeError)|0\nmarker=int",semantic_key=version)
+            self.assertEqual(snapshot.complete,version==(3,12),snapshot.reasons)
+            if version==(3,12):
+                self.assertEqual(snapshot.exits[0].pending.error_kind,"TypeError")
+            else:
+                self.assertIn("typing-union-protocol",snapshot.reasons)
+                self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_type_union_is_invalid_raised_value_and_group_method_matcher(self):
+        for operation in ("raise ValueError|TypeError", "g=ExceptionGroup('g',[ValueError()])\ng.split(ValueError|TypeError)",
+                          "(ValueError|TypeError)()"):
+            with self.subTest(operation=operation):
+                context,func,snapshot = self._solve(operation+"\nmarker=int")
+                self.assertTrue(snapshot.complete,snapshot.reasons)
+                self.assertEqual(snapshot.exits[0].pending.error_kind,"TypeError")
+                self.assertTrue(snapshot.unreachable(func.body[-1]))
+
+    def test_type_union_entry_validates_origin_shape_and_canonical_members(self):
+        context = _ProofContext("def f(u):\n    try:\n        raise ValueError()\n    except u:\n        pass\n"
+            "    marker=int\ndef allocate():\n    u=ValueError|TypeError\n")
+        func,allocate = context.tree.body
+        made = context.solve(allocate)
+        self.assertTrue(made.complete,made.reasons)
+        value = made.exits[0].lookup(context.index.node_id(allocate),"u")
+        entry = _ProofState().bind(context.index.node_id(func),"u",value)
+        snapshot = context.solve(func,entry=(entry,))
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.error_kind,"TypeError")
+        before = dict(context.total_compute)
+        self.assertIs(context.solve(func,entry=(entry,entry)),snapshot)
+        self.assertEqual(dict(context.total_compute),before)
+        site = _ProofEffects.single(value)[1]
+        for token in (("type-union",site,("ValueError",)),("type-union",site,("ValueError","ValueError")),
+                ("type-union",site,("IOError","ValueError")),("type-union",site,("missing","ValueError")),
+                ("type-union",context.index.node_id(func),("ValueError","TypeError")),
+                ("type-union",site,(1,"TypeError"))):
+            with self.subTest(token=token):
+                candidate = _ProofState().bind(context.index.node_id(func),"u",_ProofValue(frozenset({token})))
+                result = context.solve(func,entry=(candidate,))
+                self.assertFalse(result.complete)
+                self.assertIn("unsupported-union-entry",result.reasons)
+                self.assertFalse(result.unreachable(func.body[-1]))
+
+    def test_type_union_closed_retention_and_collapsed_class_identity(self):
+        context,func,snapshot = self._solve("u=ValueError|TypeError\ne=RuntimeError(u)\nu=e=0\n"
+            "same=(IOError|OSError) is OSError\nmarker=int")
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].lookup(context.index.node_id(func),"same"),_ProofValue.literal(True))
+        self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
+        context,func,snapshot = self._solve("u=ValueError|TypeError\nv=ValueError|TypeError\nsame=u is v\nmarker=int")
+        self.assertFalse(snapshot.complete)
+        self.assertIn("unproven-identity",snapshot.reasons)
+        self.assertFalse(snapshot.unreachable(func.body[-1]))
+
+    def test_type_union_storage_boundary_accounts_for_temporary_and_binding_copies(self):
+        # Native-only descriptor is union1 + args-edge/tuple2 + member edges2
+        # plus one root =6 per stored occurrence; RHS hold and binding peak12.
+        for cap,complete in ((11,False),(12,True),(13,True)):
+            with self.subTest(cap=cap):
+                context,func,snapshot = self._solve("u=ValueError|TypeError\nmarker=int",limits={"aliases":cap})
+                self.assertEqual(snapshot.complete,complete,snapshot.reasons)
+                if not complete:
+                    self.assertIn("alias-budget",snapshot.reasons)
+                    self.assertFalse(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_type_union_work_boundary_and_query_cache_do_not_change_verdict(self):
+        body = "u=(ValueError|TypeError)|(OSError|None)\ntry:\n    raise ValueError()\nexcept u:\n    pass\nmarker=int"
+        context,func,snapshot = self._solve(body)
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertEqual(snapshot.exits[0].pending.error_kind,"TypeError")
+        work = snapshot.stats["steps"]
+        for cap,complete in ((work-1,False),(work,True),(work+1,True)):
+            candidate,scope,result = self._solve(body,limits={"steps":cap})
+            self.assertEqual(result.complete,complete,result.reasons)
+            before = dict(candidate.total_compute)
+            result.states_at(scope.body[0])
+            result.unreachable(scope.body[-1])
+            result.native_identity(scope.body[-1].value,"int")
+            self.assertIs(candidate.solve(scope),result)
+            self.assertEqual(dict(candidate.total_compute),before)
+            if not complete:
+                self.assertIn("work-budget",result.reasons)
+                self.assertFalse(result.unreachable(scope.body[-1]))
+
+    def test_bitwise_or_legacy_native_singletons_match_literal_operand_profiles(self):
+        for version in ((3,12),(3,14)):
+            for spelling,operation,expected in (("True","x|2",_ProofValue.literal(3)),
+                    ("False","x|False",_ProofValue.literal(False)),("None","x|int",None)):
+                with self.subTest(version=version,spelling=spelling):
+                    context,func,snapshot = self._solve("value="+operation+"\nmarker=int",parameters="x",
+                        entry=(_ProofState().bind(1,"x",_ProofValue(frozenset({("native",spelling)}))),),semantic_key=version)
+                    self.assertTrue(snapshot.complete,snapshot.reasons)
+                    state = snapshot.exits[0]
+                    self.assertEqual(state.pending.kind,"normal")
+                    value = state.lookup(context.index.node_id(func),"value")
+                    if expected is None:
+                        self.assertEqual(_ProofEffects.single(value)[2],("NoneType","int"))
+                    else:
+                        self.assertEqual(value,expected)
+                    self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
+
+    def test_legacy_sequence_containing_union_cannot_bypass_alias_cap(self):
+        source = "def f(x):\n    marker=int\ndef allocate():\n    value=(ValueError|TypeError,)\n"
+        for cap,complete in ((7,False),(8,True),(9,True)):
+            context = _ProofContext(source,limits={"aliases":cap})
+            func,allocate = context.tree.body
+            literal = allocate.body[0].value
+            union = ("type-union",context.index.node_id(literal.elts[0]),("ValueError","TypeError"))
+            wrapped = ("sequence","tuple",context.index.node_id(literal),(frozenset({union}),),2,1)
+            seed = _ProofState().bind(context.index.node_id(func),"x",_ProofValue(frozenset({wrapped})))
+            result = context.solve(func,entry=(seed,))
+            with self.subTest(cap=cap):
+                self.assertEqual(result.complete,complete,result.reasons)
+                self.assertEqual(result.native_identity(func.body[0].value,"int"),complete)
+                if not complete:
+                    self.assertIn("alias-budget",result.reasons)
+                self.assertEqual(seed.alias_count(),8)  # Wrapper/root3 + union descriptor5.
+
+    def test_nested_union_work_and_alias_slots_survive_every_legacy_container_root(self):
+        context = _ProofContext("def f(x):\n    pass\ndef allocate():\n    value=(ValueError|TypeError,)\n    error=RuntimeError()\n")
+        func,allocate = context.tree.body
+        literal = allocate.body[0].value
+        union = ("type-union",context.index.node_id(literal.elts[0]),("ValueError","TypeError"))
+        def wrapped(atom):
+            return _ProofValue(frozenset({("sequence","tuple",context.index.node_id(literal),
+                                          (frozenset({atom}),),2,1)}))
+        def states(value):
+            payload = ("native-exception","RuntimeError",context.index.node_id(allocate.body[1].value))
+            item = _ProofExceptionObject(payload,(value,))
+            return (_ProofState().bind(context.index.node_id(func),"x",value),
+                    _ProofState(temporaries=(value,)),
+                    _ProofState(collection_objects=(_ProofCollectionObject(
+                        ("collection","list",context.index.node_id(literal),"literal"),(value,)),)),
+                    _ProofState(exception_objects=(item,),exception_metadata=(("pristine",frozenset({payload})),)),
+                    _ProofState(pending=_ProofCompletion("return",value=value)),
+                    _ProofState().write_region(("object",context.index.node_id(func)),"held",value))
+        primitive = _ProofEffects.single(_ProofValue.literal(0))
+        for position,(plain,nested) in enumerate(zip(states(wrapped(primitive)),states(wrapped(union)))):
+            with self.subTest(root=position):
+                # Shape.size counts one primitive leaf. Union work replaces
+                # that leaf with five descriptor slots: +4. Aliases add all5.
+                self.assertEqual(_ProofEffects.exception_work(nested)-_ProofEffects.exception_work(plain),4)
+                self.assertEqual(nested.alias_count()-plain.alias_count(),5)
+
+    def test_legacy_union_work_sums_compact_dag_occurrences_without_path_expansion(self):
+        union = ("type-union",0,("ValueError","TypeError"))
+        base = ("sequence","tuple",1,(frozenset({union}),),2,1)
+        for copied in (False,True):
+            other = tuple(list(base)) if copied else base
+            root = ("sequence","tuple",2,(frozenset({base}),frozenset({other})),5,2)
+            value = _ProofValue(frozenset({root}))
+            self.assertEqual(_ProofEffects.value_work(value),13)
+            self.assertEqual(_ProofState().bind(1,"x",value).alias_count(),11)
+        root = base
+        for depth in range(20):
+            root = ("sequence","tuple",depth+2,(frozenset({root}),frozenset({root})),
+                    1+2*root[4],root[5]+1)
+        value = _ProofValue(frozenset({root}))
+        self.assertEqual(_ProofEffects.value_work(value),7*(1<<20)-1)
+        self.assertEqual(_ProofState().bind(1,"x",value).alias_count(),68)
+
+    def test_legacy_union_later_constructor_work_boundary_is_cache_independent(self):
+        source = "def f(x):\n    e=RuntimeError(x)\n    marker=int\ndef allocate():\n    value=(ValueError|TypeError,)\n"
+        def solve(limits=None):
+            context = _ProofContext(source,limits=limits)
+            func,allocate = context.tree.body
+            literal = allocate.body[0].value
+            union = ("type-union",context.index.node_id(literal.elts[0]),("ValueError","TypeError"))
+            wrapped = ("sequence","tuple",context.index.node_id(literal),(frozenset({union}),),2,1)
+            seed = _ProofState().bind(context.index.node_id(func),"x",_ProofValue(frozenset({wrapped})))
+            return context,func,seed,context.solve(func,entry=(seed,))
+        context,func,seed,snapshot = solve()
+        self.assertTrue(snapshot.complete,snapshot.reasons)
+        self.assertTrue(snapshot.native_identity(func.body[-1].value,"int"))
+        work = snapshot.stats["steps"]
+        for cap,complete in ((work-1,False),(work,True),(work+1,True)):
+            candidate,scope,entry,result = solve({"steps":cap})
+            self.assertEqual(result.complete,complete,result.reasons)
+            before = dict(candidate.total_compute)
+            self.assertIs(candidate.solve(scope,entry=(entry,entry)),result)
+            self.assertEqual(dict(candidate.total_compute),before)
+            if not complete:
+                self.assertIn("work-budget",result.reasons)
+                self.assertFalse(result.native_identity(scope.body[-1].value,"int"))
+
+    def test_union_work_charges_all_stored_alternatives_even_with_unknown_flag(self):
+        first = ("type-union",0,("ValueError","TypeError"))
+        second = ("type-union",0,("OSError","TypeError"))
+        for unknown in (False,True):
+            with self.subTest(unknown=unknown):
+                value = _ProofValue(frozenset({first,second}),unknown=unknown)
+                self.assertEqual(_ProofEffects.value_work(value),10)
+                self.assertEqual(_ProofEffects.exception_work(_ProofState().bind(1,"x",value)),11)
+        self.assertEqual(_ProofEffects.value_work(_ProofValue.unknown_value("fixture")),1)
+
+    def test_union_work_does_not_decrease_when_conditional_entry_adds_alternative(self):
+        context = _ProofContext("def f(x):\n    x=0\n    marker=int\ndef allocate():\n    value=ValueError|TypeError\n")
+        func,allocate = context.tree.body
+        site = context.index.node_id(allocate.body[0].value)
+        first = ("type-union",site,("ValueError","TypeError"))
+        second = ("type-union",site,("OSError","TypeError"))
+        results = []
+        for atoms in (frozenset({first}),frozenset({first,second})):
+            entry = _ProofState().bind(context.index.node_id(func),"x",_ProofValue(atoms))
+            result = context.solve(func,entry=(entry,))
+            self.assertTrue(result.complete,result.reasons)
+            self.assertTrue(result.native_identity(func.body[-1].value,"int"))
+            results.append(result)
+        self.assertGreater(results[1].stats["steps"],results[0].stats["steps"])
+
+    def test_bitwise_or_rejects_malformed_native_tokens_before_indexing(self):
+        for token in (("native",),("native","True",0),("native","int",0),("native",1)):
+            with self.subTest(token=token):
+                context,func,snapshot = self._solve("value=x|int\nmarker=int",parameters="x",entry=(
+                    _ProofState().bind(1,"x",_ProofValue(frozenset({token}))),))
+                self.assertFalse(snapshot.complete)
+                self.assertFalse(snapshot.unreachable(func.body[-1]))
+                self.assertFalse(snapshot.native_identity(func.body[-1].value,"int"))
 
     def test_except_star_native_alias_headers_match_canonical_class_for_naked_and_grouped_errors(self):
         for original in ("OSError()","ExceptionGroup('g',[OSError()])"):
